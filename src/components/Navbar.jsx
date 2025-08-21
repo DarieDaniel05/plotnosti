@@ -10,13 +10,13 @@ const Navbar = () => {
             to="/plotnosti"
             className="text-xl font-semibold hover:text-green-400 transition-colors"
           >
-            Plotnosti
+            High orders
           </Link>
           <Link
             to="/"
             className="text-xl font-semibold hover:text-green-400 transition-colors"
           >
-            Monezi
+            Coins
           </Link>
         </div>
       </div>
