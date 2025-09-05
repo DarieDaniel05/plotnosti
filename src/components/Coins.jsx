@@ -14,12 +14,12 @@ const Coins = ({ onSelectSymbol }) => {
   const [error, setError] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [selectedSymbol, setSelectedSymbol] = useState(null);
-
+  
   const wsRef = useRef(null);
   const klineData = useRef(new Map()); // Store kline data for each symbol
   const priceData = useRef(new Map()); // Store current price data
   const reconnectTimeoutRef = useRef(null);
-
+  
   // Calculate True Range
   const calculateTR = (high, low, prevClose) => {
     if (!prevClose && prevClose !== 0) return high - low;
@@ -30,7 +30,7 @@ const Coins = ({ onSelectSymbol }) => {
     
     return Math.max(tr1, tr2, tr3);
   };
-
+  
   // Calculate NATR (Normalized Average True Range)
   const calculateNATR = (klines, period = 14) => {
     if (!klines || klines.length < period + 1) return 0;
@@ -53,7 +53,7 @@ const Coins = ({ onSelectSymbol }) => {
     
     return currentClose > 0 ? (atr / currentClose) * 100 : 0;
   };
-
+  
   // Get all futures trading symbols
   const getAllFuturesSymbols = async () => {
     try {
@@ -62,28 +62,28 @@ const Coins = ({ onSelectSymbol }) => {
       
       // Filter for active USDT perpetual futures, limit to top volume ones
       const activeSymbols = data.symbols
-        .filter(symbol => 
-          symbol.status === 'TRADING' && 
-          symbol.contractType === 'PERPETUAL' &&
-          symbol.symbol.endsWith('USDT')
-        )
-        .map(symbol => symbol.symbol);
+      .filter(symbol =>
+        symbol.status === 'TRADING' &&
+        symbol.contractType === 'PERPETUAL' &&
+        symbol.symbol.endsWith('USDT')
+      )
+      .map(symbol => symbol.symbol);
       
       // Get 24h ticker data to sort by volume and take top 100
       const tickerResponse = await fetch('https://fapi.binance.com/fapi/v1/ticker/24hr');
       const tickerData = await tickerResponse.json();
       
       const symbolsWithVolume = activeSymbols
-        .map(symbol => {
-          const ticker = tickerData.find(t => t.symbol === symbol);
-          return {
-            symbol,
-            volume: ticker ? parseFloat(ticker.quoteVolume) : 0
-          };
-        })
-        .sort((a, b) => b.volume - a.volume)
-        .filter(e => e.volume > 70_000_000) // Limit to top 50 for WebSocket performance
-        .map(item => item.symbol);
+      .map(symbol => {
+        const ticker = tickerData.find(t => t.symbol === symbol);
+        return {
+          symbol,
+          volume: ticker ? parseFloat(ticker.quoteVolume) : 0
+        };
+      })
+      .sort((a, b) => b.volume - a.volume)
+      .filter(e => e.volume > 70_000_000) // Filter high volume symbols
+      .map(item => item.symbol);
       
       console.log(`Selected top ${symbolsWithVolume.length} symbols by volume`);
       setTotalSymbols(symbolsWithVolume.length);
@@ -94,13 +94,14 @@ const Coins = ({ onSelectSymbol }) => {
       return [];
     }
   };
-
-  // Get initial kline data for NATR calculation
+  
+  // Get initial kline data for NATR calculation (1-minute intervals)
   const getInitialKlineData = async (symbols) => {
     const klinePromises = symbols.map(async (symbol) => {
       try {
+        // Fetch 1-minute klines with more data points for better NATR calculation
         const response = await fetch(
-          `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=50`
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1m&limit=100`
         );
         
         if (!response.ok) return null;
@@ -122,10 +123,10 @@ const Coins = ({ onSelectSymbol }) => {
         return null;
       }
     });
-
+    
     await Promise.all(klinePromises);
   };
-
+  
   // Get 24h ticker data
   const get24hTickers = async (symbols) => {
     try {
@@ -138,16 +139,16 @@ const Coins = ({ onSelectSymbol }) => {
       return [];
     }
   };
-
-  // Connect to WebSocket for live updates
+  
+  // Connect to WebSocket for live updates (1-minute klines)
   const connectWebSocket = (symbols) => {
     if (wsRef.current) {
       wsRef.current.close();
     }
-
+    
     try {
-      // Create combined stream for klines and tickers
-      const klineStreams = symbols.map(symbol => `${symbol.toLowerCase()}@kline_5m`);
+      // Create combined stream for 1-minute klines and tickers
+      const klineStreams = symbols.map(symbol => `${symbol.toLowerCase()}@kline_1m`);
       const tickerStreams = symbols.map(symbol => `${symbol.toLowerCase()}@ticker`);
       const allStreams = [...klineStreams, ...tickerStreams];
       
@@ -157,18 +158,18 @@ const Coins = ({ onSelectSymbol }) => {
       const ws = new WebSocket(streamUrl);
       
       ws.onopen = () => {
-        console.log('Connected to Binance WebSocket');
+        console.log('Connected to Binance WebSocket (1-minute real-time)');
         setIsConnected(true);
         setConnectedStreams(allStreams.length);
       };
-
+      
       ws.onmessage = (event) => {
         try {
           const message = JSON.parse(event.data);
           const { stream, data } = message;
           
-          if (stream.includes('@kline_5m')) {
-            // Handle kline updates
+          if (stream.includes('@kline_1m')) {
+            // Handle 1-minute kline updates
             const symbol = data.s;
             const kline = data.k;
             
@@ -185,8 +186,8 @@ const Coins = ({ onSelectSymbol }) => {
             const existingKlines = klineData.current.get(symbol) || [];
             let updatedKlines;
             
-            if (kline.x) { // Kline is closed
-              updatedKlines = [...existingKlines, newKline].slice(-50); // Keep last 50
+            if (kline.x) { // Kline is closed (1-minute completed)
+              updatedKlines = [...existingKlines, newKline].slice(-100); // Keep last 100 for better NATR
             } else {
               // Update the last kline if it's the same timestamp, otherwise add new one
               if (existingKlines.length > 0 && existingKlines[existingKlines.length - 1].timestamp === newKline.timestamp) {
@@ -209,16 +210,16 @@ const Coins = ({ onSelectSymbol }) => {
             });
           }
           
-          // Update coins data every few seconds to avoid too frequent re-renders
+          // Update coins data more frequently for 1-minute real-time updates
           if (!updateCoinsTimeout.current) {
-            updateCoinsTimeout.current = setTimeout(updateCoinsData, 2000);
+            updateCoinsTimeout.current = setTimeout(updateCoinsData, 1000); // Update every second
           }
           
         } catch (error) {
           console.error('Error parsing WebSocket message:', error);
         }
       };
-
+      
       ws.onclose = (event) => {
         console.log('WebSocket connection closed:', event.code);
         setIsConnected(false);
@@ -232,59 +233,48 @@ const Coins = ({ onSelectSymbol }) => {
           }, 5000);
         }
       };
-
+      
       ws.onerror = (error) => {
         console.error('WebSocket error:', error);
         setIsConnected(false);
         setConnectedStreams(0);
       };
-
+      
       wsRef.current = ws;
     } catch (error) {
       console.error('Failed to connect to WebSocket:', error);
       setError('Failed to connect to live data stream');
     }
   };
-
+  
   const updateCoinsTimeout = useRef(null);
-
-  // Open chart modal
-  const openChart = (symbol) => {
-  setSelectedSymbol(symbol);
-};
-
-
-  // TradingView Chart Component
-// Chart component
-const TradingViewChart = React.memo(({ symbol }) => {
-  if (!symbol) return (
-    <div className="mt-6 text-gray-400 text-center">
-      Selectează un simbol din listă pentru a vedea graficul 📊
-    </div>
-  );
-
-  const tradingViewUrl = `https://www.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol=BINANCE%3A${symbol}&interval=5&theme=dark&style=1`;
-
-  return (
-    <div className="mt-6 bg-gray-900 rounded-xl shadow-lg p-4">
-      <h2 className="text-lg font-semibold text-gray-200 mb-3">
-        Chart pentru {symbol}
-      </h2>
-      <iframe
-        key={symbol} // 👉 se reîncarcă doar când schimbi simbolul
-        src={tradingViewUrl}
-        className="w-full h-[500px] border-0 rounded-lg"
-        frameBorder="0"
-        allowTransparency={true}
-        scrolling="no"
-        allowFullScreen
-      />
-    </div>
-  );
-});
-
-
-
+  
+  const TradingViewChart = React.memo(({ symbol }) => {
+    if (!symbol) return (
+      <div className="mt-6 text-gray-400 text-center">
+        Selectează un simbol din listă pentru a vedea graficul 📊
+      </div>
+    );
+    
+    // Use 1-minute chart to match the real-time data
+    const tradingViewUrl = `https://www.tradingview.com/widgetembed/?frameElementId=tradingview_chart&symbol=BINANCE%3A${symbol}&interval=1&theme=dark&style=1`;
+    
+    return (
+      <div className="mt-6 bg-gray-900 rounded-xl shadow-lg p-4">
+        <h2 className="text-lg font-semibold text-gray-200 mb-3">
+          Chart pentru {symbol} (1-minute real-time)
+        </h2>
+        <iframe
+          key={symbol}
+          src={tradingViewUrl}
+          className="w-full h-[500px] border-0 rounded-lg"
+          allowTransparency={true}
+          allowFullScreen
+        />
+      </div>
+    );
+  });
+  
   // Update coins data from live streams
   const updateCoinsData = () => {
     updateCoinsTimeout.current = null;
@@ -312,7 +302,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
     setCoins(updatedCoins);
     setLastUpdate(new Date().toLocaleTimeString());
   };
-
+  
   // Load all data and start live updates
   const loadData = async () => {
     setIsLoading(true);
@@ -328,7 +318,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
         return;
       }
       
-      console.log('Getting initial kline data...');
+      console.log('Getting initial 1-minute kline data...');
       await getInitialKlineData(symbols);
       
       console.log('Getting 24h ticker data...');
@@ -347,7 +337,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
       // Calculate initial NATR values
       updateCoinsData();
       
-      console.log('Connecting to live WebSocket...');
+      console.log('Connecting to 1-minute live WebSocket...');
       connectWebSocket(symbols);
       
     } catch (error) {
@@ -357,7 +347,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
       setIsLoading(false);
     }
   };
-
+  
   // Filter and sort coins
   useEffect(() => {
     let filtered = coins.filter(coin => coin.natr >= natrThreshold);
@@ -375,11 +365,11 @@ const TradingViewChart = React.memo(({ symbol }) => {
     
     setFilteredCoins(filtered);
   }, [coins, natrThreshold, sortBy, sortOrder]);
-
+  
   // Initial load
   useEffect(() => {
     loadData();
-
+    
     return () => {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
@@ -392,7 +382,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
       }
     };
   }, []);
-
+  
   const formatNumber = (num, decimals = 2) => {
     if (num >= 1e9) {
       return (num / 1e9).toFixed(decimals) + 'B';
@@ -403,7 +393,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
     }
     return num.toFixed(decimals);
   };
-
+  
   const formatPrice = (price) => {
     if (price >= 1) {
       return price.toFixed(4);
@@ -413,18 +403,18 @@ const TradingViewChart = React.memo(({ symbol }) => {
       return price.toFixed(8);
     }
   };
-
+  
   if (isLoading) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
         <div className="text-center">
           <RefreshCw className="animate-spin h-12 w-12 mx-auto mb-4 text-blue-400" />
-          <p className="text-xl mb-2">Loading</p>
+          <p className="text-xl mb-2">Loading 1-minute real-time data...</p>
         </div>
       </div>
     );
   }
-
+  
   if (error) {
     return (
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
@@ -442,16 +432,16 @@ const TradingViewChart = React.memo(({ symbol }) => {
       </div>
     );
   }
-
+  
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4">
       {/* Header */}
       <div className="bg-gray-800 rounded-lg p-6 mb-6 border border-gray-700">
         <div className="flex items-center justify-between mb-4">
           <div className="flex items-center space-x-4">
-            <h1 className="text-3xl font-bold text-blue-400">Live NATR Futures Scanner</h1>
+            <h1 className="text-3xl font-bold text-blue-400">Futures Scanner</h1>
             <span className="text-sm text-gray-400 bg-gray-700 px-2 py-1 rounded">
-              Real-time Updates
+              1-minute NATR
             </span>
           </div>
           <div className="flex items-center space-x-4">
@@ -462,7 +452,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
                 <WifiOff className="h-5 w-5 text-red-400" />
               )}
               <span className="text-sm">
-                {isConnected ? `${connectedStreams} streams` : 'Disconnected'}
+                {isConnected ? `${connectedStreams} streams (1m)` : 'Disconnected'}
               </span>
             </div>
             <button
@@ -475,7 +465,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
             </button>
           </div>
         </div>
-
+        
         {/* Stats */}
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
           <div className="bg-gray-700 p-4 rounded-lg">
@@ -487,7 +477,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
             <p className="text-gray-400 text-sm mb-1">High NATR Coins</p>
             <p className="text-2xl font-bold text-green-400">{filteredCoins.length}</p>
           </div>
-
+          
           <div className="bg-gray-700 p-4 rounded-lg">
             <p className="text-gray-400 text-sm mb-1">NATR Threshold</p>
             <div className="flex items-center space-x-2">
@@ -500,7 +490,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
               <span className="text-sm">%</span>
             </div>
           </div>
-
+          
           <div className="bg-gray-700 p-4 rounded-lg">
             <p className="text-gray-400 text-sm mb-1">Last Update</p>
             <div className="flex items-center space-x-2">
@@ -509,7 +499,7 @@ const TradingViewChart = React.memo(({ symbol }) => {
             </div>
           </div>
         </div>
-
+        
         {/* Controls */}
         <div className="flex items-center space-x-4">
           <div className="flex items-center space-x-2">
@@ -534,99 +524,92 @@ const TradingViewChart = React.memo(({ symbol }) => {
           </div>
         </div>
       </div>
-
+      
       {/* Results Table */}
       <div className="bg-gray-800 rounded-lg border border-gray-700">
         <div className="p-4 border-b border-gray-700">
           <h2 className="text-xl font-semibold flex items-center space-x-2">
             <Activity className="h-5 w-5" />
-            <span>Live High NATR Coins ({natrThreshold}%)</span>
+            <span>Coin (NATR {natrThreshold}%)</span>
           </h2>
         </div>
         
         <div className="overflow-x-auto">
           <table className="w-full">
             <thead className="bg-gray-700">
-              <tr>
-                <th className="px-4 py-3 text-left text-sm font-medium text-gray-300">Symbol</th>
-                <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">NATR %</th>
-                <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">Price</th>
-                <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">24h Change</th>
-                <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">Volume</th>
-                <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">Trades</th>
-                <th className="px-4 py-3 text-center text-sm font-medium text-gray-300">Status</th>
-              </tr>
+            <tr>
+              <th className="px-4 py-3 text-left text-sm font-medium text-gray-300">Symbol</th>
+              <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">NATR %</th>
+              <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">24h Change</th>
+              <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">Volume</th>
+              <th className="px-4 py-3 text-right text-sm font-medium text-gray-300">Trades</th>
+              <th className="px-4 py-3 text-center text-sm font-medium text-gray-300">Status</th>
+            </tr>
             </thead>
             <tbody>
-              {filteredCoins.map((coin, index) => {
-                const isPositive = coin.priceChangePercent >= 0;
-                return (
-                  <tr key={coin.symbol} className="border-b border-gray-700 hover:bg-gray-750 transition-colors">
-                    <td className="px-4 py-3">
-                      <div className="flex items-center space-x-2">
-                        <button
-                          onClick={() => onSelectSymbol(coin.symbol)}
-                          className="font-mono font-bold text-yellow-400 hover:text-yellow-300 cursor-pointer flex items-center space-x-1 group bg-transparent border-0 p-0"
-                        >
-                          <span>{coin.symbol}</span>
-                          <BarChart3 className="h-4 w-4 opacity-0 group-hover:opacity-100 transition-opacity" />
-                        </button>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-right">
+            {filteredCoins.map((coin, index) => {
+              const isPositive = coin.priceChangePercent >= 0;
+              return (
+                <tr key={coin.symbol} className="border-b border-gray-700 hover:bg-gray-750 transition-colors">
+                  <td className="px-4 py-3">
+                    <div className="flex items-center space-x-2">
+                      <button
+                        onClick={() => onSelectSymbol(coin.symbol)}
+                        className="font-mono font-bold text-yellow-400 hover:text-yellow-300 cursor-pointer flex items-center space-x-1 group bg-transparent border-0 p-0"
+                      >
+                        <span>{coin.symbol}</span>
+                        <BarChart3 className="h-4 w-4 opacity-0 group-hover:opacity-100 transition-opacity" />
+                      </button>
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-right">
                       <span className="font-mono font-bold text-purple-400">
                         {coin.natr.toFixed(2)}%
                       </span>
-                    </td>
-                    <td className="px-4 py-3 text-right font-mono">
-                      ${formatPrice(coin.price)}
-                    </td>
-                    <td className="px-4 py-3 text-right">
-                      <div className="flex items-center justify-end space-x-1">
-                        {isPositive ? (
-                          <TrendingUp className="h-4 w-4 text-green-400" />
-                        ) : (
-                          <TrendingDown className="h-4 w-4 text-red-400" />
-                        )}
-                        <span className={`font-mono ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
+                  </td>
+                  <td className="px-4 py-3 text-right">
+                    <div className="flex items-center justify-end space-x-1">
+                      {isPositive ? (
+                        <TrendingUp className="h-4 w-4 text-green-400" />
+                      ) : (
+                        <TrendingDown className="h-4 w-4 text-red-400" />
+                      )}
+                      <span className={`font-mono ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
                           {coin.priceChangePercent.toFixed(2)}%
                         </span>
-                      </div>
-                    </td>
-                    <td className="px-4 py-3 text-right font-mono text-gray-400">
-                      {formatNumber(coin.volume)}
-                    </td>
-                    <td className="px-4 py-3 text-right font-mono text-gray-400">
-                      {formatNumber(coin.trades, 0)}
-                    </td>
-                    <td className="px-4 py-3 text-center">
-                      <div className="flex items-center justify-center space-x-1">
-                        <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
-                        <span className="text-xs text-green-400">LIVE</span>
-                      </div>
-                    </td>
-                  </tr>
-                );
-              })}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 text-right font-mono text-gray-400">
+                    {formatNumber(coin.volume)}
+                  </td>
+                  <td className="px-4 py-3 text-right font-mono text-gray-400">
+                    {formatNumber(coin.trades, 0)}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <div className="flex items-center justify-center space-x-1">
+                      <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+                      <span className="text-xs text-green-400">LIVE</span>
+                    </div>
+                  </td>
+                </tr>
+              );
+            })}
             </tbody>
           </table>
           
           {filteredCoins.length === 0 && !isLoading && (
             <div className="text-center py-12 text-gray-400">
               <Activity className="h-12 w-12 mx-auto mb-4 opacity-50" />
-              <p className="text-lg">No coins found with NATR {natrThreshold}%</p>
+              <p className="text-lg">No coins found with NATR ≥ {natrThreshold}%</p>
               <p className="text-sm">
-                {isConnected ? 'Monitoring live data...' : 'Waiting for connection...'}
+                {isConnected ? 'Coins' : 'Waiting for connection...'}
               </p>
             </div>
           )}
         </div>
       </div>
-
-      {/* Chart sub tabel */}
-
     </div>
-  );  
+  );
 };
 
 export default Coins;
