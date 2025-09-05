@@ -13,8 +13,6 @@ const Coins = ({ onSelectSymbol }) => {
   const [connectedStreams, setConnectedStreams] = useState(0);
   const [error, setError] = useState('');
   const [isConnected, setIsConnected] = useState(false);
-  const [selectedSymbol, setSelectedSymbol] = useState(null);
-  
   const wsRef = useRef(null);
   const klineData = useRef(new Map()); // Store kline data for each symbol
   const priceData = useRef(new Map()); // Store current price data
@@ -409,7 +407,7 @@ const Coins = ({ onSelectSymbol }) => {
       <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
         <div className="text-center">
           <RefreshCw className="animate-spin h-12 w-12 mx-auto mb-4 text-blue-400" />
-          <p className="text-xl mb-2">Loading 1-minute real-time data...</p>
+          <p className="text-xl mb-2">Loading</p>
         </div>
       </div>
     );
