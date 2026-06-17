@@ -213,7 +213,7 @@ function SpotPage() {
             const qtyNum = parseFloat(qty);
             const sum = priceNum * qtyNum;
             
-            if (sum >= 250000) {
+            if (sum >= 300000) {
               // FIXED: More stable and precise order key
               const orderKey = `${symbol}-${type}-${priceNum.toFixed(8)}-${qtyNum.toFixed(8)}`;
               
@@ -253,7 +253,7 @@ function SpotPage() {
             "XRPUSDT","ETHUSDC","SOLUSDC","DOGEUSDC","XRPUSDC",
             "AVAXUSDT","BTCUSDT_250328","BNBUSDT","CRVUSDT",
             "EOSUSDT","LINKUSDT","LTCUSDT","SUIUSDT","ADAUSDT",
-            "ADAUSDC","TRUMPUSDT","WIFUSDT", "ENAUSDC", "ENAUSDT","BCHUSDT","SUIUSDC","FILUSDT","FILUSDC","LINKUSDC","FARTCOINUSDT","FARTCOINUSDC",
+            "ADAUSDC","TRUMPUSDT","WIFUSDT", "ENAUSDC", "ENAUSDT","BCHUSDT","SUIUSDC","FILUSDT","FILUSDC","LINKUSDC","FARTCOINUSDT","FARTCOINUSDC", "XAGUSDT", "CLUSDT", "ZECUSDT", "NVDAUSDT", "XAUUSDT", "DOTUSDT"
           ].includes(moneda.symbol) && moneda.quoteVolume >= 50000000
       );
 

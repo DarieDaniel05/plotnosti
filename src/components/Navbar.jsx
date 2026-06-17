@@ -18,6 +18,12 @@ const Navbar = () => {
           >
             Coins
           </Link>
+          <Link
+            to="/dailyHighMove"
+            className="text-xl font-semibold hover:text-green-400 transition-colors"
+          >
+            Daily High Move
+          </Link>
         </div>
       </div>
     </nav>
