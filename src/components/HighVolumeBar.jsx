@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Activity, RefreshCw, AlertTriangle, Zap, Clock, BarChart2, ArrowUpRight, TrendingUp } from "lucide-react";
 
 // ── Star helpers ─────────────────────────────────────────────────────────────
@@ -36,39 +36,75 @@ const STAR_LABELS = [
 ];
 
 const StarsTooltip = ({ flags }) => {
-  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState(null);
+  const iconRef = useRef(null);
+
   if (!flags) return null;
+
+  const handleMouseEnter = () => {
+    if (!iconRef.current) return;
+    const r = iconRef.current.getBoundingClientRect();
+    const tooltipHeight = 168;
+    const tooltipWidth  = 250;
+
+    // apare deasupra iconului daca incape, altfel dedesubt
+    const top  = r.top > tooltipHeight + 16
+      ? r.top - tooltipHeight - 8
+      : r.bottom + 8;
+
+    // nu iesim din ecran pe orizontala
+    const left = Math.max(8, Math.min(r.right - tooltipWidth, window.innerWidth - tooltipWidth - 8));
+
+    setPos({ top, left });
+  };
+
   return (
-    <div style={{ position: "relative", display: "inline-block" }}>
+    <>
       <span
-        onMouseEnter={() => setOpen(true)}
-        onMouseLeave={() => setOpen(false)}
+        ref={iconRef}
+        onMouseEnter={handleMouseEnter}
+        onMouseLeave={() => setPos(null)}
         style={{ cursor: "help", color: "#475569", fontSize: 11, userSelect: "none" }}
-      >ⓘ</span>
-      {open && (
+      >
+        ⓘ
+      </span>
+
+      {pos && (
         <div style={{
-          position: "absolute", right: 0, bottom: "calc(100% + 8px)",
-          background: "#1a1e27", border: "1px solid #2d3348",
-          borderRadius: 8, padding: "10px 14px", zIndex: 99,
-          minWidth: 230, pointerEvents: "none",
-          boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+          position: "fixed",
+          top: pos.top,
+          left: pos.left,
+          background: "#1a1e27",
+          border: "1px solid #2d3348",
+          borderRadius: 8,
+          padding: "10px 14px",
+          zIndex: 9999,
+          minWidth: 240,
+          pointerEvents: "none",
+          boxShadow: "0 8px 32px rgba(0,0,0,0.7)",
         }}>
-          <p style={{ margin: "0 0 8px", fontSize: 10, color: "#475569", fontWeight: 600, letterSpacing: "0.05em" }}>
+          <p style={{
+            margin: "0 0 8px", fontSize: 10,
+            color: "#475569", fontWeight: 600, letterSpacing: "0.05em",
+          }}>
             CONDIȚII STELE
           </p>
           {STAR_LABELS.map((label, i) => (
             <div key={i} style={{
-              fontSize: 11, marginBottom: i < 3 ? 6 : 0,
+              fontSize: 11,
+              marginBottom: i < 3 ? 6 : 0,
               color: flags[i] ? "#00e676" : "#334155",
               display: "flex", alignItems: "center", gap: 8,
             }}>
-              <span style={{ fontSize: 12, flexShrink: 0 }}>{flags[i] ? "✓" : "○"}</span>
+              <span style={{ fontSize: 12, flexShrink: 0 }}>
+                {flags[i] ? "✓" : "○"}
+              </span>
               <span>★ {label}</span>
             </div>
           ))}
         </div>
       )}
-    </div>
+    </>
   );
 };
 
