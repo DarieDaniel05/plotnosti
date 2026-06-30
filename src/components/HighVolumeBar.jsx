@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { Activity, RefreshCw, AlertTriangle, Zap, Clock, BarChart2, ArrowUpRight, TrendingUp } from "lucide-react";
+import { Activity, RefreshCw, AlertTriangle, Zap, Clock, BarChart2, ArrowUpRight, TrendingUp, Bell } from "lucide-react";
 
-// ── Star helpers ─────────────────────────────────────────────────────────────
+// ── Star helpers (scală 0-4, identică cu logica Android) ──────────────────────
 const starsColor = (n) => {
   if (n >= 4) return "#FF4D4D";
   if (n === 3) return "#FF8C00";
@@ -28,33 +28,26 @@ const StarsBadge = ({ count }) => {
   );
 };
 
+// Ordinea identică cu blocul de stele din VolumeCheckWorker.kt
 const STAR_LABELS = [
-  "Vol. curent ≥ 5x media 24h",
-  "Mișcare preț ≥ 3%",
-  "Small-cap (vol. zilnic < 50M USDT)",
-  "Accelerare: H-2 < H-1 < H",
+  "Liniște înainte de furtună (avg 6h < 30% din avg24h)",
+  "Mișcare preț ≥ 3% pe candela curentă",
+  "Small-cap (vol. zilnic 1–50M USDT)",
+  "Accelerare: H-2 < H-1 < H curent",
 ];
 
 const StarsTooltip = ({ flags }) => {
   const [pos, setPos] = useState(null);
   const iconRef = useRef(null);
-
   if (!flags) return null;
 
   const handleMouseEnter = () => {
     if (!iconRef.current) return;
     const r = iconRef.current.getBoundingClientRect();
-    const tooltipHeight = 168;
-    const tooltipWidth  = 250;
-
-    // apare deasupra iconului daca incape, altfel dedesubt
-    const top  = r.top > tooltipHeight + 16
-      ? r.top - tooltipHeight - 8
-      : r.bottom + 8;
-
-    // nu iesim din ecran pe orizontala
+    const tooltipHeight = 148;
+    const tooltipWidth = 250;
+    const top = r.top > tooltipHeight + 16 ? r.top - tooltipHeight - 8 : r.bottom + 8;
     const left = Math.max(8, Math.min(r.right - tooltipWidth, window.innerWidth - tooltipWidth - 8));
-
     setPos({ top, left });
   };
 
@@ -65,40 +58,25 @@ const StarsTooltip = ({ flags }) => {
         onMouseEnter={handleMouseEnter}
         onMouseLeave={() => setPos(null)}
         style={{ cursor: "help", color: "#475569", fontSize: 11, userSelect: "none" }}
-      >
-        ⓘ
-      </span>
-
+      >ⓘ</span>
       {pos && (
         <div style={{
-          position: "fixed",
-          top: pos.top,
-          left: pos.left,
-          background: "#1a1e27",
-          border: "1px solid #2d3348",
-          borderRadius: 8,
-          padding: "10px 14px",
-          zIndex: 9999,
-          minWidth: 240,
-          pointerEvents: "none",
+          position: "fixed", top: pos.top, left: pos.left,
+          background: "#1a1e27", border: "1px solid #2d3348",
+          borderRadius: 8, padding: "10px 14px", zIndex: 9999,
+          minWidth: 240, pointerEvents: "none",
           boxShadow: "0 8px 32px rgba(0,0,0,0.7)",
         }}>
-          <p style={{
-            margin: "0 0 8px", fontSize: 10,
-            color: "#475569", fontWeight: 600, letterSpacing: "0.05em",
-          }}>
+          <p style={{ margin: "0 0 8px", fontSize: 10, color: "#475569", fontWeight: 600, letterSpacing: "0.05em" }}>
             CONDIȚII STELE
           </p>
           {STAR_LABELS.map((label, i) => (
             <div key={i} style={{
-              fontSize: 11,
-              marginBottom: i < 3 ? 6 : 0,
+              fontSize: 11, marginBottom: i < STAR_LABELS.length - 1 ? 6 : 0,
               color: flags[i] ? "#00e676" : "#334155",
-              display: "flex", alignItems: "center", gap: 8,
+              display: "flex", alignItems: "flex-start", gap: 8,
             }}>
-              <span style={{ fontSize: 12, flexShrink: 0 }}>
-                {flags[i] ? "✓" : "○"}
-              </span>
+              <span style={{ fontSize: 12, flexShrink: 0, marginTop: 1 }}>{flags[i] ? "✓" : "○"}</span>
               <span>★ {label}</span>
             </div>
           ))}
@@ -114,68 +92,73 @@ const HighVolumeBar = () => {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState("");
   const [lastUpdate, setLastUpdate] = useState("");
-  const [multiplier, setMultiplier] = useState(3);
   const [totalScanned, setTotalScanned] = useState(0);
   const [scanProgress, setScanProgress] = useState(0);
 
   // limit=28:
   //   [0..23]  → 24 candele pentru media 24h
-  //   [24]     → H-2
-  //   [25]     → H-1
-  //   [26]     → H curent închis
-  //   [27]     → candela curentă deschisă (ignorată)
-  const fetchKlines = async (symbol, mult) => {
+  //   [20..25] → ultimele 6 ore (baseline avg6h)
+  //   [24]     → H-2     [25] → H-1     [26] → H curent (închis)     [27] → deschis (ignorat)
+  const fetchKlines = async (symbol) => {
     try {
-      const res = await fetch(
-        `https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=28`
-      );
+      const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=28`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const klines = await res.json();
       if (klines.length < 28) return null;
 
-      // Volum base asset (index 5)
-      const h2BaseVol   = parseFloat(klines[24][5]);
-      const h1BaseVol   = parseFloat(klines[25][5]);
-      const currBaseVol = parseFloat(klines[26][5]);
+      // Volum bază asset (index 5) — folosit pentru toate comparațiile/filtrele
+      const hourMinus2Volume = parseFloat(klines[24][5]);
+      const hourMinus1Volume = parseFloat(klines[25][5]);
+      const currentVolume    = parseFloat(klines[26][5]);
 
-      // Quote volume USDT (index 7) — afișare + small-cap check
-      const h2QuoteVol   = parseFloat(klines[24][7]);
-      const h1QuoteVol   = parseFloat(klines[25][7]);
+      // Quote volume USDT (index 7) — doar pentru afișare $
       const currQuoteVol = parseFloat(klines[26][7]);
 
       const openPrice  = parseFloat(klines[26][1]);
       const closePrice = parseFloat(klines[26][4]);
-      const highPrice  = parseFloat(klines[26][2]);
       const openTime   = klines[26][0];
-      const priceChangePct = openPrice > 0 ? Math.abs((closePrice - openPrice) / openPrice) * 100 : 0;
 
-      // Media 24h volum (base)
+      // baseline ponderat pt. pragul x3 — identic cu Android: H-1 + H-2/2
+      const totalHoursVolume = hourMinus1Volume + hourMinus2Volume / 2.0;
+
+      // media ultimelor 6h (H-6..H-1) — baseline principal
+      let sum6h = 0;
+      for (let i = 20; i <= 25; i++) sum6h += parseFloat(klines[i][5]);
+      const avg6h = sum6h / 6;
+
+      // media 24h
       let sum24h = 0;
       for (let i = 0; i < 24; i++) sum24h += parseFloat(klines[i][5]);
-      const avg24hBase = sum24h / 24;
+      const avg24h = sum24h / 24;
 
-      // Volum zilnic USDT (suma 24h quote)
-      let dailyQuote = 0;
-      for (let i = 0; i < 24; i++) dailyQuote += parseFloat(klines[i][7]);
+      // volum zilnic USDT — ultimele 24h INCLUSIV ora curenta H (indices 3..26)
+      // (inainte insuma 0..23, care se oprea cu 3 ore inainte de H si rata exact spike-ul)
+      let dailyUsdt = 0;
+      for (let i = 3; i <= 26; i++) dailyUsdt += parseFloat(klines[i][7]);
 
-      const sumPrev = h2BaseVol + h1BaseVol;
-      if (sumPrev <= 0) return null;
+      // ── Filtre obligatorii (identice cu VolumeCheckWorker.kt) ──────────────
+      if (currentVolume < avg24h * 5 || currentVolume < avg6h * 10) return null;
+      if (dailyUsdt <= 7_000_000) return null;
+      if (currentVolume < totalHoursVolume * 3) return null;
+      if (openPrice > closePrice) return null; // doar candele verzi
 
-      const ratio = currBaseVol / sumPrev;
-      if (ratio < mult) return null;
+      // ── Calcul stele ────────────────────────────────────────────────────
+      const pricePct = openPrice > 0 ? Math.abs((closePrice - openPrice) / openPrice) : 0;
 
-      // ── Calcul stele ──────────────────────────────────────────────────────
-      const flag1 = avg24hBase > 0 && currBaseVol >= avg24hBase * 5;
-      const flag2 = priceChangePct >= 3;
-      const flag3 = dailyQuote >= 1 && dailyQuote < 50_000_000;
-      const flag4 = h2BaseVol > 0 && h2BaseVol < h1BaseVol && h1BaseVol < currBaseVol;
+      const flag1 = avg24h > 0 && avg6h < avg24h * 0.3;
+      const flag2 = pricePct >= 0.03;
+      const flag3 = dailyUsdt >= 1 && dailyUsdt <= 50_000_000;
+      const flag4 = hourMinus2Volume > 0 && hourMinus2Volume < hourMinus1Volume && hourMinus1Volume < currentVolume;
       const flags = [flag1, flag2, flag3, flag4];
       const stars = flags.filter(Boolean).length;
 
+      const ratio = currentVolume / avg6h;
+      const notifyWorthy = currentVolume >= totalHoursVolume * 10 && stars >= 3;
+
       return {
-        ratio, stars, flags,
-        currQuoteVol, h1QuoteVol, h2QuoteVol,
-        openPrice, closePrice, highPrice,
+        ratio, stars, flags, notifyWorthy,
+        currQuoteVol,
+        openPrice, closePrice,
         priceChange: ((closePrice - openPrice) / openPrice) * 100,
         openTime,
       };
@@ -209,7 +192,7 @@ const HighVolumeBar = () => {
         const batch = symbols.slice(i, i + BATCH);
         const results = await Promise.all(
           batch.map(async (sym) => {
-            const d = await fetchKlines(sym, multiplier);
+            const d = await fetchKlines(sym);
             if (!d) return null;
             return { symbol: sym.replace("USDT", ""), fullSymbol: sym, ...d };
           })
@@ -219,8 +202,12 @@ const HighVolumeBar = () => {
         if (i + BATCH < symbols.length) await new Promise(r => setTimeout(r, 80));
       }
 
-      // Sorteaza: stele desc → ratio desc
-      found.sort((a, b) => b.stars !== a.stars ? b.stars - a.stars : b.ratio - a.ratio);
+      // Sortare: notifyWorthy (ar trimite push pe telefon) → stele → ratio
+      found.sort((a, b) => {
+        if (a.notifyWorthy !== b.notifyWorthy) return a.notifyWorthy ? -1 : 1;
+        if (b.stars !== a.stars) return b.stars - a.stars;
+        return b.ratio - a.ratio;
+      });
 
       setScanProgress(100);
       setMovers(found);
@@ -230,7 +217,7 @@ const HighVolumeBar = () => {
     } finally {
       setIsLoading(false);
     }
-  }, [multiplier]);
+  }, []);
 
   useEffect(() => { runScan(); }, [runScan]);
 
@@ -243,20 +230,17 @@ const HighVolumeBar = () => {
   };
   const fmtPrice = (p) => {
     if (p >= 1000) return p.toFixed(2);
-    if (p >= 1)    return p.toFixed(4);
+    if (p >= 1) return p.toFixed(4);
     if (p >= 0.001) return p.toFixed(6);
     return p.toFixed(8);
   };
-  const fmtHour = (ts) =>
-    new Date(ts).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
-  const ratioColor = (r) =>
-    r >= 10 ? "#ff4d4d" : r >= 7 ? "#ff8c00" : r >= 5 ? "#ffd700" : "#00e676";
-  const ratioBg = (r) =>
-    r >= 10 ? "rgba(255,77,77,0.10)" : r >= 7 ? "rgba(255,140,0,0.10)"
-      : r >= 5 ? "rgba(255,215,0,0.10)" : "rgba(0,230,118,0.08)";
-  const openTV = (sym) =>
-    window.open(`https://www.tradingview.com/chart/?symbol=BINANCE%3A${sym}`, "_blank");
+  const fmtHour = (ts) => new Date(ts).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
+  const ratioColor = (r) => r >= 25 ? "#ff4d4d" : r >= 15 ? "#ff8c00" : r >= 10 ? "#ffd700" : "#00e676";
+  const ratioBg = (r) => r >= 25 ? "rgba(255,77,77,0.10)" : r >= 15 ? "rgba(255,140,0,0.10)"
+    : r >= 10 ? "rgba(255,215,0,0.10)" : "rgba(0,230,118,0.08)";
+  const openTV = (sym) => window.open(`https://www.tradingview.com/chart/?symbol=BINANCE%3A${sym}`, "_blank");
 
+  const notifyCount = movers.filter(m => m.notifyWorthy).length;
   const starDist = [4, 3, 2, 1, 0].map(n => ({
     n, count: movers.filter(m => m.stars === n).length
   })).filter(s => s.count > 0);
@@ -287,9 +271,6 @@ const HighVolumeBar = () => {
               border: "1px solid rgba(0,230,118,0.3)",
             }}>FUTURES 1H</span>
           </div>
-          <p style={{ color: "#64748b", fontSize: 12, margin: 0 }}>
-            Vol(H) ≥ {multiplier}x (H-1 + H-2) · sortat ★↓ ratio↓ · hover ⓘ → condiții · click → TradingView
-          </p>
         </div>
 
         {/* ── Stat cards ── */}
@@ -298,31 +279,15 @@ const HighVolumeBar = () => {
           gap: 10, marginBottom: 14,
         }}>
           <div style={cardStyle}>
-            <p style={labelStyle}>MULTIPLICATOR</p>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <input
-                type="number" value={multiplier} min={1} max={50} step={0.5}
-                onChange={e => setMultiplier(parseFloat(e.target.value) || 3)}
-                style={{
-                  background: "#1a1e27", border: "1px solid #2d3348", color: "#00e676",
-                  borderRadius: 6, padding: "4px 8px", width: 52, fontSize: 20, fontWeight: 700,
-                  fontFamily: "inherit", outline: "none",
-                }}
-              />
-              <span style={{ color: "#00e676", fontSize: 20, fontWeight: 700 }}>x</span>
-            </div>
-          </div>
-
-          <div style={cardStyle}>
             <p style={labelStyle}>SCANATE</p>
             <p style={bigNumStyle}>{totalScanned || "—"}</p>
             <p style={subLabelStyle}>simboluri futures</p>
           </div>
 
           <div style={cardStyle}>
-            <p style={labelStyle}>GĂSITE</p>
+            <p style={labelStyle}>ÎN LISTĂ</p>
             <p style={{ ...bigNumStyle, color: "#00e676" }}>{movers.length}</p>
-            <p style={subLabelStyle}>≥ {multiplier}x volum</p>
+            <p style={subLabelStyle}>trec toate filtrele</p>
           </div>
 
           <div style={cardStyle}>
@@ -332,17 +297,12 @@ const HighVolumeBar = () => {
                 <span style={{ color: "#334155", fontSize: 12 }}>—</span>
               ) : starDist.map(({ n, count }) => (
                 <div key={n} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{
-                    color: starsColor(n), fontSize: 11, minWidth: 56,
-                    letterSpacing: n > 0 ? 2 : 0,
-                  }}>
+                  <span style={{ color: starsColor(n), fontSize: 11, minWidth: 50, letterSpacing: n > 0 ? 2 : 0 }}>
                     {n > 0 ? "★".repeat(n) : "fără ★"}
                   </span>
-                  <span style={{
-                    color: "#64748b", fontSize: 11,
-                    background: "#1a1e27", borderRadius: 4,
-                    padding: "1px 6px",
-                  }}>{count}</span>
+                  <span style={{ color: "#64748b", fontSize: 11, background: "#1a1e27", borderRadius: 4, padding: "1px 6px" }}>
+                    {count}
+                  </span>
                 </div>
               ))}
             </div>
@@ -370,34 +330,15 @@ const HighVolumeBar = () => {
           </div>
         </div>
 
-        {/* ── Legenda ── */}
-        <div style={{
-          background: "#111318", border: "1px solid #1e2330", borderRadius: 8,
-          padding: "10px 16px", marginBottom: 14,
-          display: "flex", flexWrap: "wrap", gap: "8px 20px", alignItems: "center",
-        }}>
-          <span style={{ color: "#475569", fontSize: 10, fontWeight: 600, letterSpacing: "0.06em" }}>LEGENDĂ</span>
-          {STAR_LABELS.map((label, i) => (
-            <span key={i} style={{ fontSize: 11, color: "#64748b", display: "flex", alignItems: "center", gap: 5 }}>
-              <span style={{ color: "#ffd700", fontSize: 12 }}>★</span>{label}
-            </span>
-          ))}
-        </div>
 
         {/* ── Loading ── */}
         {isLoading && (
-          <div style={{
-            background: "#111318", border: "1px solid #1e2330", borderRadius: 12,
-            padding: "52px 24px", textAlign: "center",
-          }}>
+          <div style={{ background: "#111318", border: "1px solid #1e2330", borderRadius: 12, padding: "52px 24px", textAlign: "center" }}>
             <Zap size={34} color="#00e676" style={{ margin: "0 auto 14px", display: "block", animation: "pulse 1.2s ease-in-out infinite" }} />
             <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 18 }}>
-              Se analizează volumele + calculul stelelor · {totalScanned > 0 ? `${totalScanned} simboluri` : ""}
+              Se aplică filtrele și se calculează stelele · {totalScanned > 0 ? `${totalScanned} simboluri` : ""}
             </p>
-            <div style={{
-              background: "#1a1e27", borderRadius: 999, height: 5,
-              width: 260, margin: "0 auto", overflow: "hidden",
-            }}>
+            <div style={{ background: "#1a1e27", borderRadius: 999, height: 5, width: 260, margin: "0 auto", overflow: "hidden" }}>
               <div style={{
                 height: "100%", borderRadius: 999,
                 background: "linear-gradient(90deg, #00e676, #69f0ae)",
@@ -429,7 +370,7 @@ const HighVolumeBar = () => {
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <BarChart2 size={15} color="#00e676" />
                 <span style={{ fontSize: 12, color: "#94a3b8" }}>
-                  {movers.length} monede · ≥ {multiplier}x · sortat ★↓ ratio↓
+                  {movers.length} monede · sortat 🔔→★→ratio
                 </span>
               </div>
               <span style={{ fontSize: 10, color: "#2d3348" }}>hover ⓘ → condiții · click → TradingView</span>
@@ -439,16 +380,16 @@ const HighVolumeBar = () => {
               <div style={{ padding: "64px 24px", textAlign: "center" }}>
                 <TrendingUp size={38} color="#1e2330" style={{ margin: "0 auto 14px", display: "block" }} />
                 <p style={{ color: "#475569", fontSize: 14, marginBottom: 6 }}>
-                  Nicio monedă nu îndeplinește condiția de {multiplier}x volum.
+                  Nicio monedă nu îndeplinește toate filtrele în acest moment.
                 </p>
-                <p style={{ color: "#334155", fontSize: 12 }}>Încearcă un multiplicator mai mic.</p>
+                <p style={{ color: "#334155", fontSize: 12 }}>Volum, candelă verde și small-cap trebuie să coincidă.</p>
               </div>
             ) : (
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse" }}>
                   <thead>
                     <tr style={{ background: "#0d1017" }}>
-                      {["#", "Simbol", "★", "Ratio", "Vol. Curent", "Vol. H-1", "Vol. H-2", "Preț", "Variație", "Oră"].map((h, i) => (
+                      {["#", "Simbol", "★", "Ratio", "Vol. Curent", "Preț", "Variație", "Oră"].map((h, i) => (
                         <th key={i} style={{
                           padding: "11px 14px",
                           textAlign: i <= 2 ? "left" : "right",
@@ -468,17 +409,17 @@ const HighVolumeBar = () => {
                           key={coin.fullSymbol}
                           onClick={() => openTV(coin.fullSymbol)}
                           style={{
-                            background: idx % 2 === 0 ? "transparent" : "rgba(255,255,255,0.012)",
+                            background: coin.notifyWorthy ? "rgba(255,77,77,0.04)"
+                              : idx % 2 === 0 ? "transparent" : "rgba(255,255,255,0.012)",
                             borderBottom: "1px solid #1a1e27",
+                            borderLeft: coin.notifyWorthy ? "2px solid #FF4D4D" : "2px solid transparent",
                             cursor: "pointer", transition: "background 0.15s",
                           }}
                           onMouseEnter={e => e.currentTarget.style.background = "rgba(0,230,118,0.045)"}
-                          onMouseLeave={e => e.currentTarget.style.background = idx % 2 === 0 ? "transparent" : "rgba(255,255,255,0.012)"}
+                          onMouseLeave={e => e.currentTarget.style.background = coin.notifyWorthy ? "rgba(255,77,77,0.04)" : (idx % 2 === 0 ? "transparent" : "rgba(255,255,255,0.012)")}
                         >
                           {/* rank */}
-                          <td style={{ padding: "11px 14px", color: "#2d3348", fontSize: 11 }}>
-                            {idx + 1}
-                          </td>
+                          <td style={{ padding: "11px 14px", color: "#2d3348", fontSize: 11 }}>{idx + 1}</td>
 
                           {/* symbol */}
                           <td style={{ padding: "11px 14px" }}>
@@ -491,12 +432,7 @@ const HighVolumeBar = () => {
                               }}>
                                 {coin.symbol.slice(0, 4)}
                               </div>
-                              <div>
-                                <p style={{ margin: 0, fontWeight: 700, color: "#f1f5f9", fontSize: 13 }}>
-                                  {coin.symbol}
-                                </p>
-                                <p style={{ margin: 0, color: "#334155", fontSize: 10 }}>USDT Perp</p>
-                              </div>
+                              
                             </div>
                           </td>
 
@@ -516,25 +452,13 @@ const HighVolumeBar = () => {
                               borderRadius: 6, padding: "4px 9px",
                             }}>
                               <ArrowUpRight size={13} color={rc} />
-                              <span style={{ color: rc, fontWeight: 800, fontSize: 14 }}>
-                                x{coin.ratio.toFixed(1)}
-                              </span>
+                              <span style={{ color: rc, fontWeight: 800, fontSize: 14 }}>x{coin.ratio.toFixed(1)}</span>
                             </div>
                           </td>
 
                           {/* vol curent */}
                           <td style={{ padding: "11px 14px", textAlign: "right", color: "#f1f5f9", fontWeight: 700, fontSize: 12 }}>
                             ${fmtVol(coin.currQuoteVol)}
-                          </td>
-
-                          {/* vol h-1 */}
-                          <td style={{ padding: "11px 14px", textAlign: "right", color: "#64748b", fontSize: 12 }}>
-                            ${fmtVol(coin.h1QuoteVol)}
-                          </td>
-
-                          {/* vol h-2 */}
-                          <td style={{ padding: "11px 14px", textAlign: "right", color: "#475569", fontSize: 12 }}>
-                            ${fmtVol(coin.h2QuoteVol)}
                           </td>
 
                           {/* pret */}
@@ -563,9 +487,6 @@ const HighVolumeBar = () => {
           </div>
         )}
 
-        <p style={{ color: "#1e2330", fontSize: 10, textAlign: "center", marginTop: 16 }}>
-          Date: API public Binance Futures · Vol(H) ≥ {multiplier}x (H-1 + H-2) · Candele 1h închise
-        </p>
       </div>
 
       <style>{`
@@ -576,19 +497,9 @@ const HighVolumeBar = () => {
   );
 };
 
-const cardStyle = {
-  background: "#111318", border: "1px solid #1e2330",
-  borderRadius: 10, padding: "14px 16px",
-};
-const labelStyle = {
-  color: "#475569", fontSize: 10, fontWeight: 600,
-  letterSpacing: "0.06em", marginBottom: 8, marginTop: 0,
-};
-const bigNumStyle = {
-  fontSize: 26, fontWeight: 700, color: "#fff", margin: 0,
-};
-const subLabelStyle = {
-  color: "#334155", fontSize: 10, margin: 0, marginTop: 2,
-};
+const cardStyle = { background: "#111318", border: "1px solid #1e2330", borderRadius: 10, padding: "14px 16px" };
+const labelStyle = { color: "#475569", fontSize: 10, fontWeight: 600, letterSpacing: "0.06em", marginBottom: 8, marginTop: 0 };
+const bigNumStyle = { fontSize: 26, fontWeight: 700, color: "#fff", margin: 0 };
+const subLabelStyle = { color: "#334155", fontSize: 10, margin: 0, marginTop: 2 };
 
 export default HighVolumeBar;
