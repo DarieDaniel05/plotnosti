@@ -336,7 +336,7 @@ const HighVolumeBar = () => {
           <div style={{ background: "#111318", border: "1px solid #1e2330", borderRadius: 12, padding: "52px 24px", textAlign: "center" }}>
             <Zap size={34} color="#00e676" style={{ margin: "0 auto 14px", display: "block", animation: "pulse 1.2s ease-in-out infinite" }} />
             <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 18 }}>
-              Se aplică filtrele și se calculează stelele · {totalScanned > 0 ? `${totalScanned} simboluri` : ""}
+              Loading · {totalScanned > 0 ? `${totalScanned} simboluri` : ""}
             </p>
             <div style={{ background: "#1a1e27", borderRadius: 999, height: 5, width: 260, margin: "0 auto", overflow: "hidden" }}>
               <div style={{
@@ -370,7 +370,7 @@ const HighVolumeBar = () => {
               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                 <BarChart2 size={15} color="#00e676" />
                 <span style={{ fontSize: 12, color: "#94a3b8" }}>
-                  {movers.length} monede · sortat 🔔→★→ratio
+                  {movers.length} monede
                 </span>
               </div>
               <span style={{ fontSize: 10, color: "#2d3348" }}>hover ⓘ → condiții · click → TradingView</span>
@@ -382,7 +382,6 @@ const HighVolumeBar = () => {
                 <p style={{ color: "#475569", fontSize: 14, marginBottom: 6 }}>
                   Nicio monedă nu îndeplinește toate filtrele în acest moment.
                 </p>
-                <p style={{ color: "#334155", fontSize: 12 }}>Volum, candelă verde și small-cap trebuie să coincidă.</p>
               </div>
             ) : (
               <div style={{ overflowX: "auto" }}>
