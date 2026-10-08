@@ -28,7 +28,7 @@ const Navbar = () => {
             to="/highVolumeBar"
             className="text-xl font-semibold hover:text-green-400 transition-colors"
           >
-            High volume bar
+            Liquidity map
           </Link>
         </div>
       </div>
