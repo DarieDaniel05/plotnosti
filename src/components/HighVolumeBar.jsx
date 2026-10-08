@@ -1,504 +1,1200 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { Activity, RefreshCw, AlertTriangle, Zap, Clock, BarChart2, ArrowUpRight, TrendingUp, Bell } from "lucide-react";
+import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { createChart } from 'lightweight-charts';
 
-// ── Star helpers (scală 0-4, identică cu logica Android) ──────────────────────
-const starsColor = (n) => {
-  if (n >= 4) return "#FF4D4D";
-  if (n === 3) return "#FF8C00";
-  if (n === 2) return "#FFD700";
-  if (n === 1) return "#8B949E";
-  return "transparent";
-};
-
-const StarsBadge = ({ count }) => {
-  if (!count) return null;
-  return (
-    <span style={{
-      display: "inline-flex", alignItems: "center", gap: 2,
-      background: `${starsColor(count)}22`,
-      border: `1px solid ${starsColor(count)}55`,
-      borderRadius: 4, padding: "2px 7px",
-      fontSize: 11, fontWeight: 700,
-      color: starsColor(count),
-      letterSpacing: 2,
-      fontFamily: "inherit",
-    }}>
-      {"★".repeat(count)}
-    </span>
-  );
-};
-
-// Ordinea identică cu blocul de stele din VolumeCheckWorker.kt
-const STAR_LABELS = [
-  "Liniște înainte de furtună (avg 6h < 30% din avg24h)",
-  "Mișcare preț ≥ 3% pe candela curentă",
-  "Small-cap (vol. zilnic 1–50M USDT)",
-  "Accelerare: H-2 < H-1 < H curent",
+const TIMEFRAMES = [
+  { label: '1m', value: '1m' },
+  { label: '5m', value: '5m' },
+  { label: '15m', value: '15m' },
+  { label: '1h', value: '1h' },
+  { label: '4h', value: '4h' },
+  { label: '1d', value: '1d' },
 ];
 
-const StarsTooltip = ({ flags }) => {
-  const [pos, setPos] = useState(null);
-  const iconRef = useRef(null);
-  if (!flags) return null;
+const ROW_HEIGHT = 20;
+const VISIBLE_BUFFER = 10;
 
-  const handleMouseEnter = () => {
-    if (!iconRef.current) return;
-    const r = iconRef.current.getBoundingClientRect();
-    const tooltipHeight = 148;
-    const tooltipWidth = 250;
-    const top = r.top > tooltipHeight + 16 ? r.top - tooltipHeight - 8 : r.bottom + 8;
-    const left = Math.max(8, Math.min(r.right - tooltipWidth, window.innerWidth - tooltipWidth - 8));
-    setPos({ top, left });
-  };
-
-  return (
-    <>
-      <span
-        ref={iconRef}
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={() => setPos(null)}
-        style={{ cursor: "help", color: "#475569", fontSize: 11, userSelect: "none" }}
-      >ⓘ</span>
-      {pos && (
-        <div style={{
-          position: "fixed", top: pos.top, left: pos.left,
-          background: "#1a1e27", border: "1px solid #2d3348",
-          borderRadius: 8, padding: "10px 14px", zIndex: 9999,
-          minWidth: 240, pointerEvents: "none",
-          boxShadow: "0 8px 32px rgba(0,0,0,0.7)",
-        }}>
-          <p style={{ margin: "0 0 8px", fontSize: 10, color: "#475569", fontWeight: 600, letterSpacing: "0.05em" }}>
-            CONDIȚII STELE
-          </p>
-          {STAR_LABELS.map((label, i) => (
-            <div key={i} style={{
-              fontSize: 11, marginBottom: i < STAR_LABELS.length - 1 ? 6 : 0,
-              color: flags[i] ? "#00e676" : "#334155",
-              display: "flex", alignItems: "flex-start", gap: 8,
-            }}>
-              <span style={{ fontSize: 12, flexShrink: 0, marginTop: 1 }}>{flags[i] ? "✓" : "○"}</span>
-              <span>★ {label}</span>
-            </div>
-          ))}
-        </div>
-      )}
-    </>
-  );
+const formatDollarVolume = (valInDollars) => {
+  if (!valInDollars || valInDollars <= 0) return '';
+  if (valInDollars >= 1000000) return `$${(valInDollars / 1000000).toFixed(1)}M`;
+  if (valInDollars >= 1000) return `$${(valInDollars / 1000).toFixed(1)}K`;
+  return `$${valInDollars.toFixed(0)}`;
 };
 
-// ── Main component ────────────────────────────────────────────────────────────
-const HighVolumeBar = () => {
-  const [movers, setMovers] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState("");
-  const [lastUpdate, setLastUpdate] = useState("");
-  const [totalScanned, setTotalScanned] = useState(0);
-  const [scanProgress, setScanProgress] = useState(0);
+export default function DeepLiquidityHeatmapChart() {
+  const [symbol, setSymbol] = useState('OGNUSDT');
+  const [searchSymbol, setSearchSymbol] = useState('');
+  const [symbolsList, setSymbolsList] = useState([]);
+  const [timeframe, setTimeframe] = useState('1m');
+  const [orderBook, setOrderBook] = useState({ bids: {}, asks: {} });
+  const [currentPrice, setCurrentPrice] = useState(null);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [hoveredPrice, setHoveredPrice] = useState(null);
 
-  // limit=28:
-  //   [0..23]  → 24 candele pentru media 24h
-  //   [20..25] → ultimele 6 ore (baseline avg6h)
-  //   [24]     → H-2     [25] → H-1     [26] → H curent (închis)     [27] → deschis (ignorat)
-  const fetchKlines = async (symbol) => {
-    try {
-      const res = await fetch(`https://fapi.binance.com/fapi/v1/klines?symbol=${symbol}&interval=1h&limit=28`);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const klines = await res.json();
-      if (klines.length < 28) return null;
+  // Tab activ pentru mobil: 'chart' sau 'dom'
+  const [activeTab, setActiveTab] = useState('chart');
 
-      // Volum bază asset (index 5) — folosit pentru toate comparațiile/filtrele
-      const hourMinus2Volume = parseFloat(klines[24][5]);
-      const hourMinus1Volume = parseFloat(klines[25][5]);
-      const currentVolume    = parseFloat(klines[26][5]);
+  // Stări pentru comutarea vizibilității și pragul de lichiditate minimă
+  const [showLiquidity, setShowLiquidity] = useState(true);
+  const [showSweeps, setShowSweeps] = useState(true);
+  const [minLiquidityUsd, setMinLiquidityUsd] = useState(10000);
+  const [minLiquidityInput, setMinLiquidityInput] = useState('10000');
 
-      // Quote volume USDT (index 7) — doar pentru afișare $
-      const currQuoteVol = parseFloat(klines[26][7]);
+  const [priceStepPercent, setPriceStepPercent] = useState(0.1);
+  const [inputValue, setInputValue] = useState('0.1');
+  const [autoCenter, setAutoCenter] = useState(true);
+  const [fixedAnchorPrice, setFixedAnchorPrice] = useState(null);
 
-      const openPrice  = parseFloat(klines[26][1]);
-      const closePrice = parseFloat(klines[26][4]);
-      const openTime   = klines[26][0];
+  const [trades, setTrades] = useState([]);
 
-      // baseline ponderat pt. pragul x3 — identic cu Android: H-1 + H-2/2
-      const totalHoursVolume = hourMinus1Volume + hourMinus2Volume / 2.0;
+  const [scrollTop, setScrollTop] = useState(0);
+  const [containerHeight, setContainerHeight] = useState(600);
 
-      // media ultimelor 6h (H-6..H-1) — baseline principal
-      let sum6h = 0;
-      for (let i = 20; i <= 25; i++) sum6h += parseFloat(klines[i][5]);
-      const avg6h = sum6h / 6;
+  const chartContainerRef = useRef(null);
+  const chartCanvasOverlayRef = useRef(null);
+  const chartInstanceRef = useRef(null);
+  const candlestickSeriesRef = useRef(null);
+  const volumeSeriesRef = useRef(null);
+  const currentCandleRef = useRef(null);
+  const domContainerRef = useRef(null);
 
-      // media 24h
-      let sum24h = 0;
-      for (let i = 0; i < 24; i++) sum24h += parseFloat(klines[i][5]);
-      const avg24h = sum24h / 24;
+  const localOrderBookRef = useRef({ bids: {}, asks: {} });
+  const activeLiquidityRef = useRef({});
+  const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
+  const markersRef = useRef([]); // Stochează markerele de sweep pe grafic
 
-      // volum zilnic USDT — ultimele 24h INCLUSIV ora curenta H (indices 3..26)
-      // (inainte insuma 0..23, care se oprea cu 3 ore inainte de H si rata exact spike-ul)
-      let dailyUsdt = 0;
-      for (let i = 3; i <= 26; i++) dailyUsdt += parseFloat(klines[i][7]);
-
-      // ── Filtre obligatorii (identice cu VolumeCheckWorker.kt) ──────────────
-      if (currentVolume < avg24h * 5 || currentVolume < avg6h * 10) return null;
-      if (dailyUsdt <= 7_000_000) return null;
-      if (currentVolume < totalHoursVolume * 3) return null;
-      if (openPrice > closePrice) return null; // doar candele verzi
-
-      // ── Calcul stele ────────────────────────────────────────────────────
-      const pricePct = openPrice > 0 ? Math.abs((closePrice - openPrice) / openPrice) : 0;
-
-      const flag1 = avg24h > 0 && avg6h < avg24h * 0.3;
-      const flag2 = pricePct >= 0.03;
-      const flag3 = dailyUsdt >= 1 && dailyUsdt <= 50_000_000;
-      const flag4 = hourMinus2Volume > 0 && hourMinus2Volume < hourMinus1Volume && hourMinus1Volume < currentVolume;
-      const flags = [flag1, flag2, flag3, flag4];
-      const stars = flags.filter(Boolean).length;
-
-      const ratio = currentVolume / avg6h;
-      const notifyWorthy = currentVolume >= totalHoursVolume * 10 && stars >= 3;
-
-      return {
-        ratio, stars, flags, notifyWorthy,
-        currQuoteVol,
-        openPrice, closePrice,
-        priceChange: ((closePrice - openPrice) / openPrice) * 100,
-        openTime,
-      };
-    } catch {
-      return null;
+  // Redimensionare redesenare grafic la schimbarea tab-ului
+  useEffect(() => {
+    if (activeTab === 'chart' && chartInstanceRef.current && chartContainerRef.current) {
+      setTimeout(() => {
+        chartInstanceRef.current?.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+          height: chartContainerRef.current.clientHeight,
+        });
+        requestAnimationFrame(drawLiquidityMap);
+      }, 50);
     }
-  };
+  }, [activeTab]);
 
-  const runScan = useCallback(async () => {
-    setIsLoading(true);
-    setError("");
-    setScanProgress(0);
-    setMovers([]);
+  // Adăugare marker pe grafic
+  const addSweepMarker = useCallback((time, price, type, volume) => {
+    if (!candlestickSeriesRef.current || !showSweeps) return;
 
-    try {
-      const exRes = await fetch("https://fapi.binance.com/fapi/v1/exchangeInfo");
-      if (!exRes.ok) throw new Error("Eroare la lista de simboluri");
-      const exData = await exRes.json();
+    const isBuySweep = type === 'BUY_SWEEP'; // Prețul a urcat și a măturat ASKS (Lichiditate Buy-side)
+    
+    const newMarker = {
+      time: time,
+      position: isBuySweep ? 'aboveBar' : 'belowBar',
+      color: isBuySweep ? '#f59e0b' : '#3b82f6',
+      shape: isBuySweep ? 'arrowDown' : 'arrowUp',
+      text: `SWEEP ${formatDollarVolume(volume)}`,
+    };
 
-      const symbols = exData.symbols
-        .filter(s => s.status === "TRADING" && s.contractType === "PERPETUAL" && s.symbol.endsWith("USDT"))
-        .map(s => s.symbol);
+    // Evităm duplicatele pe aceeași lumânare / același tip
+    const exists = markersRef.current.some(
+      (m) => m.time === time && m.shape === newMarker.shape
+    );
 
-      setTotalScanned(symbols.length);
-      setScanProgress(5);
+    if (!exists) {
+      markersRef.current = [...markersRef.current, newMarker].slice(-50); // Păstrăm ultimele 50
+      candlestickSeriesRef.current.setMarkers(markersRef.current);
+    }
+  }, [showSweeps]);
 
-      const BATCH = 30;
-      const found = [];
+  // Sincronizare și detectare SWEEP de lichiditate
+  const syncAndFilterLiquidity = useCallback((latestPrice, candleHigh, candleLow) => {
+    const ob = localOrderBookRef.current;
+    const currentActive = {};
 
-      for (let i = 0; i < symbols.length; i += BATCH) {
-        const batch = symbols.slice(i, i + BATCH);
-        const results = await Promise.all(
-          batch.map(async (sym) => {
-            const d = await fetchKlines(sym);
-            if (!d) return null;
-            return { symbol: sym.replace("USDT", ""), fullSymbol: sym, ...d };
-          })
-        );
-        found.push(...results.filter(Boolean));
-        setScanProgress(5 + Math.round(((i + batch.length) / symbols.length) * 90));
-        if (i + BATCH < symbols.length) await new Promise(r => setTimeout(r, 80));
+    Object.entries(ob.asks).forEach(([pStr, vol]) => {
+      const p = parseFloat(pStr);
+      const valUSD = p * vol;
+
+      if (valUSD >= minLiquidityUsd) {
+        currentActive[p] = valUSD;
       }
+    });
 
-      // Sortare: notifyWorthy (ar trimite push pe telefon) → stele → ratio
-      found.sort((a, b) => {
-        if (a.notifyWorthy !== b.notifyWorthy) return a.notifyWorthy ? -1 : 1;
-        if (b.stars !== a.stars) return b.stars - a.stars;
-        return b.ratio - a.ratio;
+    Object.entries(ob.bids).forEach(([pStr, vol]) => {
+      const p = parseFloat(pStr);
+      const valUSD = p * vol;
+
+      if (valUSD >= minLiquidityUsd) {
+        currentActive[p] = valUSD;
+      }
+    });
+
+    const high = candleHigh || latestPrice;
+    const low = candleLow || latestPrice;
+
+    if (high && low) {
+      Object.keys(currentActive).forEach((pStr) => {
+        const p = parseFloat(pStr);
+
+        // Detectare Liquidity Sweep: Prețul/Lumânarea a depășit un nivel cu lichiditate mare
+        if (p >= low && p <= high) {
+          const sweptVolume = currentActive[p];
+          const isBuySweep = p >= (latestPrice || high);
+
+          // Adăugăm în istoricul vizual al nivelurilor măturate
+          sweptLiquidityRef.current.push({
+            price: p,
+            volume: sweptVolume,
+            timestamp: Date.now(),
+            type: isBuySweep ? 'BUY_SWEEP' : 'SELL_SWEEP',
+          });
+
+          // Păstrăm doar sweep-urile recente (ultimele 15 secunde) pentru animație/evidențiere pe Heatmap
+          const now = Date.now();
+          sweptLiquidityRef.current = sweptLiquidityRef.current.filter(
+            (s) => now - s.timestamp < 15000
+          );
+
+          // Adăugăm marker pe lumânare
+          if (currentCandleRef.current) {
+            addSweepMarker(
+              currentCandleRef.current.time,
+              p,
+              isBuySweep ? 'BUY_SWEEP' : 'SELL_SWEEP',
+              sweptVolume
+            );
+          }
+
+          // Eliminăm nivelul din lichiditatea activă (a fost măturat)
+          delete currentActive[p];
+        }
       });
-
-      setScanProgress(100);
-      setMovers(found);
-      setLastUpdate(new Date().toLocaleTimeString("ro-RO"));
-    } catch (err) {
-      setError("Eroare: " + err.message);
-    } finally {
-      setIsLoading(false);
     }
+
+    activeLiquidityRef.current = currentActive;
+  }, [minLiquidityUsd, addSweepMarker]);
+
+  // Măsurarea containerului DOM
+  useEffect(() => {
+    if (!domContainerRef.current) return;
+
+    const updateHeight = () => {
+      if (domContainerRef.current) {
+        setContainerHeight(domContainerRef.current.clientHeight);
+      }
+    };
+
+    updateHeight();
+    window.addEventListener('resize', updateHeight);
+
+    return () => window.removeEventListener('resize', updateHeight);
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (currentPrice && fixedAnchorPrice === null) {
+      setFixedAnchorPrice(currentPrice);
+    }
+  }, [currentPrice, fixedAnchorPrice]);
+
+  // Resetarea datelor la schimbarea simbolului
+  useEffect(() => {
+    setFixedAnchorPrice(null);
+    setCurrentPrice(null);
+    setOrderBook({ bids: {}, asks: {} });
+    setAutoCenter(true);
+    setTrades([]);
+    setHoveredPrice(null);
+    setScrollTop(0);
+
+    currentCandleRef.current = null;
+    localOrderBookRef.current = { bids: {}, asks: {} };
+    activeLiquidityRef.current = {};
+    sweptLiquidityRef.current = [];
+    markersRef.current = [];
+
+    if (candlestickSeriesRef.current) {
+      candlestickSeriesRef.current.setMarkers([]);
+    }
+
+    if (domContainerRef.current) {
+      domContainerRef.current.scrollTop = 0;
+    }
+
+    if (candlestickSeriesRef.current) {
+      candlestickSeriesRef.current.setData([]);
+    }
+
+    if (volumeSeriesRef.current) {
+      volumeSeriesRef.current.setData([]);
+    }
+
+    if (chartInstanceRef.current) {
+      chartInstanceRef.current.timeScale().fitContent();
+    }
+
+    requestAnimationFrame(() => {
+      if (chartCanvasOverlayRef.current) {
+        const canvas = chartCanvasOverlayRef.current;
+        const ctx = canvas.getContext('2d');
+        ctx?.clearRect(0, 0, canvas.width, canvas.height);
+      }
+    });
+  }, [symbol]);
+
+  const tickStep = useMemo(() => {
+    const base = fixedAnchorPrice || currentPrice || 1;
+    if (base <= 0 || priceStepPercent <= 0) return 0.00005;
+    return (base * priceStepPercent) / 100;
+  }, [fixedAnchorPrice, currentPrice, priceStepPercent]);
+
+  const precision = useMemo(() => {
+    if (!tickStep) return 5;
+    const str = tickStep.toFixed(8).toString();
+    const parts = str.split('.');
+    if (parts.length > 1) {
+      const decimals = parts[1].replace(/0+$/, '').length;
+      return Math.max(2, Math.min(6, decimals));
+    }
+    return 5;
+  }, [tickStep]);
+
+  // Încărcarea simbolurilor Binance
+  useEffect(() => {
+    fetch('https://api.binance.com/api/v3/exchangeInfo')
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        if (data.symbols) {
+          const usdtPairs = data.symbols
+            .filter((s) => s.status === 'TRADING' && s.quoteAsset === 'USDT')
+            .map((s) => s.symbol);
+
+          setSymbolsList(usdtPairs);
+        }
+      })
+      .catch((err) => console.error('Eroare la încărcarea simbolurilor:', err));
   }, []);
 
-  useEffect(() => { runScan(); }, [runScan]);
+  // Snapshot Order Book
+  useEffect(() => {
+    let cancelled = false;
+    const sym = symbol.toUpperCase();
 
-  // ── Helpers ──────────────────────────────────────────────────────────────
-  const fmtVol = (v) => {
-    if (v >= 1e9) return (v / 1e9).toFixed(2) + "B";
-    if (v >= 1e6) return (v / 1e6).toFixed(2) + "M";
-    if (v >= 1e3) return (v / 1e3).toFixed(2) + "K";
-    return v.toFixed(0);
+    fetch(`https://api.binance.com/api/v3/depth?symbol=${sym}&limit=1000`)
+      .then((res) => {
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        if (cancelled) return;
+
+        if (data.code) {
+          throw new Error(data.msg || 'Binance API error');
+        }
+
+        const bidsObj = {};
+        const asksObj = {};
+
+        if (data.bids) {
+          data.bids.forEach(([p, q]) => {
+            bidsObj[parseFloat(p)] = parseFloat(q);
+          });
+        }
+
+        if (data.asks) {
+          data.asks.forEach(([p, q]) => {
+            asksObj[parseFloat(p)] = parseFloat(q);
+          });
+        }
+
+        localOrderBookRef.current = { bids: bidsObj, asks: asksObj };
+        setOrderBook({ bids: bidsObj, asks: asksObj });
+
+        syncAndFilterLiquidity(
+          currentPrice,
+          currentCandleRef.current?.high,
+          currentCandleRef.current?.low
+        );
+
+        requestAnimationFrame(drawLiquidityMap);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error('Eroare la încărcarea Order Book:', err);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol, syncAndFilterLiquidity, currentPrice]);
+
+  // Desenarea hărții de lichiditate și a SWEEPS-urilor pe Canvas
+  const drawLiquidityMap = useCallback(() => {
+    const canvas = chartCanvasOverlayRef.current;
+    const chartContainer = chartContainerRef.current;
+    const chart = chartInstanceRef.current;
+    const series = candlestickSeriesRef.current;
+
+    if (!canvas || !chartContainer || !chart || !series) return;
+
+    const width = chartContainer.clientWidth;
+    const height = chartContainer.clientHeight;
+
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
+    }
+
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, width, height);
+
+    if (!showLiquidity) return;
+
+    const activeLevels = activeLiquidityRef.current;
+    const values = Object.values(activeLevels);
+
+    const maxVal = Math.max(...values, minLiquidityUsd * 2, 1);
+    const bandHeight = Math.max(
+      4,
+      Math.min(14, 1500 / (chart.timeScale().width() || 500))
+    );
+
+    // 1. Desenare Lichiditate Activă (Heatmap)
+    Object.entries(activeLevels).forEach(([pStr, valUSD]) => {
+      const price = parseFloat(pStr);
+      const yCoord = series.priceToCoordinate(price);
+
+      if (yCoord === null || yCoord < 0 || yCoord > height) return;
+
+      const intensity = Math.min(
+        1,
+        Math.max(
+          0.1,
+          (valUSD - minLiquidityUsd) /
+            (maxVal - minLiquidityUsd || 1)
+        )
+      );
+
+      const r = Math.round(255 + (220 - 255) * intensity);
+      const g = Math.round(140 * (1 - intensity));
+      const b = Math.round(38 * intensity);
+      const alpha = 0.25 + intensity * 0.55;
+
+      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+      ctx.fillRect(0, yCoord - bandHeight / 2, width, bandHeight);
+    });
+
+    // 2. Desenare Animații / Evidențieri Liquidity Sweep (Recent Măturate)
+    if (showSweeps && sweptLiquidityRef.current.length > 0) {
+      const now = Date.now();
+      sweptLiquidityRef.current.forEach((sweep) => {
+        const elapsed = now - sweep.timestamp;
+        if (elapsed > 15000) return; // Expirează după 15s
+
+        const yCoord = series.priceToCoordinate(sweep.price);
+        if (yCoord === null || yCoord < 0 || yCoord > height) return;
+
+        // Animație de fading out
+        const fadeRatio = 1 - elapsed / 15000;
+        
+        // Linie punctată vibrantă pe nivelul măturat
+        ctx.save();
+        ctx.strokeStyle = sweep.type === 'BUY_SWEEP' 
+          ? `rgba(245, 158, 11, ${fadeRatio})` 
+          : `rgba(59, 130, 246, ${fadeRatio})`;
+        ctx.lineWidth = 2;
+        ctx.setLineDash([6, 4]);
+        
+        ctx.beginPath();
+        ctx.moveTo(0, yCoord);
+        ctx.lineTo(width, yCoord);
+        ctx.stroke();
+        ctx.restore();
+
+        // Etichetă "SWEEP"
+        ctx.fillStyle = sweep.type === 'BUY_SWEEP' 
+          ? `rgba(245, 158, 11, ${fadeRatio * 0.9})` 
+          : `rgba(59, 130, 246, ${fadeRatio * 0.9})`;
+        ctx.font = 'bold 10px sans-serif';
+        ctx.fillText(
+          `⚡ SWEEP: ${formatDollarVolume(sweep.volume)}`, 
+          width - 130, 
+          yCoord - 3
+        );
+      });
+    }
+  }, [showLiquidity, showSweeps, minLiquidityUsd]);
+
+  useEffect(() => {
+    syncAndFilterLiquidity(
+      currentPrice,
+      currentCandleRef.current?.high,
+      currentCandleRef.current?.low
+    );
+    requestAnimationFrame(drawLiquidityMap);
+  }, [orderBook, currentPrice, showLiquidity, minLiquidityUsd, syncAndFilterLiquidity, drawLiquidityMap]);
+
+  // Inițializarea graficului
+  useEffect(() => {
+    if (!chartContainerRef.current) return;
+
+    const chart = createChart(chartContainerRef.current, {
+      width: chartContainerRef.current.clientWidth,
+      height: chartContainerRef.current.clientHeight,
+      layout: {
+        background: { color: '#0b0e14' },
+        textColor: '#9CA3AF',
+      },
+      grid: {
+        vertLines: { color: '#161b26' },
+        horzLines: { color: '#161b26' },
+      },
+      crosshair: { mode: 1 },
+      localization: {
+        priceFormatter: (price) => {
+          if (typeof price !== 'number') return '';
+          if (price < 0.1) return price.toFixed(5);
+          if (price < 10) return price.toFixed(4);
+          return price.toFixed(2);
+        },
+      },
+      timeScale: {
+        timeVisible: true,
+        secondsVisible: false,
+      },
+      rightPriceScale: {
+        autoScale: true,
+        scaleMargins: { top: 0.05, bottom: 0.25 },
+      },
+    });
+
+    const candleSeries = chart.addCandlestickSeries({
+      upColor: '#22c55e',
+      downColor: '#ef4444',
+      borderUpColor: '#22c55e',
+      borderDownColor: '#ef4444',
+      wickUpColor: '#22c55e',
+      wickDownColor: '#ef4444',
+      priceFormat: {
+        type: 'price',
+        precision: 5,
+        minMove: 0.00001,
+      },
+    });
+
+    const volumeSeries = chart.addHistogramSeries({
+      color: '#26a69a',
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'volume_scale',
+    });
+
+    chart.priceScale('volume_scale').applyOptions({
+      scaleMargins: { top: 0.8, bottom: 0 },
+    });
+
+    chartInstanceRef.current = chart;
+    candlestickSeriesRef.current = candleSeries;
+    volumeSeriesRef.current = volumeSeries;
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
+      requestAnimationFrame(drawLiquidityMap);
+    });
+
+    const handleResize = () => {
+      if (chartContainerRef.current) {
+        chart.applyOptions({
+          width: chartContainerRef.current.clientWidth,
+          height: chartContainerRef.current.clientHeight,
+        });
+
+        requestAnimationFrame(drawLiquidityMap);
+      }
+    };
+
+    window.addEventListener('resize', handleResize);
+
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      chart.remove();
+      chartInstanceRef.current = null;
+      candlestickSeriesRef.current = null;
+      volumeSeriesRef.current = null;
+    };
+  }, [drawLiquidityMap]);
+
+  // Încărcarea lumânărilor
+  useEffect(() => {
+    let cancelled = false;
+    const requestedSymbol = symbol.toUpperCase();
+
+    fetch(
+      `https://api.binance.com/api/v3/klines?symbol=${requestedSymbol}&interval=${timeframe}&limit=300`
+    )
+      .then((res) => {
+        if (!res.ok) throw new Error(`Binance Klines HTTP ${res.status}`);
+        return res.json();
+      })
+      .then((data) => {
+        if (
+          cancelled ||
+          !Array.isArray(data) ||
+          !candlestickSeriesRef.current ||
+          !volumeSeriesRef.current
+        ) {
+          return;
+        }
+
+        const formattedCandles = data.map((d) => ({
+          time: d[0] / 1000,
+          open: parseFloat(d[1]),
+          high: parseFloat(d[2]),
+          low: parseFloat(d[3]),
+          close: parseFloat(d[4]),
+        }));
+
+        const formattedVolume = data.map((d) => ({
+          time: d[0] / 1000,
+          value: parseFloat(d[5]),
+          color:
+            parseFloat(d[1]) <= parseFloat(d[4])
+              ? 'rgba(34, 197, 94, 0.3)'
+              : 'rgba(239, 68, 68, 0.3)',
+        }));
+
+        candlestickSeriesRef.current.setData(formattedCandles);
+        volumeSeriesRef.current.setData(formattedVolume);
+
+        if (formattedCandles.length > 0) {
+          const lastCandle = formattedCandles[formattedCandles.length - 1];
+
+          currentCandleRef.current = { ...lastCandle };
+          setCurrentPrice(lastCandle.close);
+          setFixedAnchorPrice(lastCandle.close);
+        }
+
+        const timeScale = chartInstanceRef.current?.timeScale();
+
+        timeScale?.fitContent();
+        timeScale?.scrollToRealTime();
+
+        requestAnimationFrame(drawLiquidityMap);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error('Eroare la încărcarea graficului:', err);
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [symbol, timeframe, drawLiquidityMap]);
+
+  // Actualizări WebSocket
+  useEffect(() => {
+    const sym = symbol.toLowerCase();
+
+    const ws = new WebSocket(
+      `wss://stream.binance.com:9443/stream?streams=${sym}@kline_${timeframe}/${sym}@depth@100ms/${sym}@ticker/${sym}@trade`
+    );
+
+    ws.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        const data = message.data || message;
+
+        if (data.e === 'trade') {
+          const price = parseFloat(data.p);
+          const qty = parseFloat(data.q);
+          const dollarVal = price * qty;
+          const isBuyerMaker = data.m;
+
+          const newTrade = {
+            id: data.t,
+            price,
+            dollarVal,
+            isBuy: !isBuyerMaker,
+            time: new Date(data.T).toLocaleTimeString(),
+          };
+
+          setTrades((prev) => [newTrade, ...prev.slice(0, 49)]);
+        }
+
+        if (data.e === '24hrTicker') {
+          const price = parseFloat(data.c);
+
+          setCurrentPrice(price);
+
+          if (candlestickSeriesRef.current && currentCandleRef.current) {
+            const updatedCandle = {
+              ...currentCandleRef.current,
+              close: price,
+              high: Math.max(currentCandleRef.current.high, price),
+              low: Math.min(currentCandleRef.current.low, price),
+            };
+
+            currentCandleRef.current = updatedCandle;
+            candlestickSeriesRef.current.update(updatedCandle);
+
+            syncAndFilterLiquidity(
+              price,
+              updatedCandle.high,
+              updatedCandle.low
+            );
+          }
+        }
+
+        if (data.e === 'kline') {
+          const k = data.k;
+
+          const candle = {
+            time: k.t / 1000,
+            open: parseFloat(k.o),
+            high: parseFloat(k.h),
+            low: parseFloat(k.l),
+            close: parseFloat(k.c),
+          };
+
+          currentCandleRef.current = candle;
+          candlestickSeriesRef.current?.update(candle);
+
+          volumeSeriesRef.current?.update({
+            time: k.t / 1000,
+            value: parseFloat(k.v),
+            color:
+              parseFloat(k.o) <= parseFloat(k.c)
+                ? 'rgba(34, 197, 94, 0.3)'
+                : 'rgba(239, 68, 68, 0.3)',
+          });
+
+          setCurrentPrice(candle.close);
+
+          syncAndFilterLiquidity(
+            candle.close,
+            candle.high,
+            candle.low
+          );
+        }
+
+        if (data.e === 'depthUpdate') {
+          const ob = localOrderBookRef.current;
+
+          if (data.b) {
+            data.b.forEach(([pStr, qStr]) => {
+              const p = parseFloat(pStr);
+              const q = parseFloat(qStr);
+
+              if (q === 0) {
+                delete ob.bids[p];
+              } else {
+                ob.bids[p] = q;
+              }
+            });
+          }
+
+          if (data.a) {
+            data.a.forEach(([pStr, qStr]) => {
+              const p = parseFloat(pStr);
+              const q = parseFloat(qStr);
+
+              if (q === 0) {
+                delete ob.asks[p];
+              } else {
+                ob.asks[p] = q;
+              }
+            });
+          }
+
+          localOrderBookRef.current = ob;
+          setOrderBook({ bids: { ...ob.bids }, asks: { ...ob.asks } });
+
+          syncAndFilterLiquidity(
+            currentPrice,
+            currentCandleRef.current?.high,
+            currentCandleRef.current?.low
+          );
+        }
+      } catch (err) {
+        console.error('Eroare la procesarea datelor WebSocket:', err);
+      }
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [symbol, timeframe, currentPrice, syncAndFilterLiquidity]);
+
+  const { bestAsk, bestBid } = useMemo(() => {
+    const askPrices = Object.keys(orderBook.asks).map(Number);
+    const bidPrices = Object.keys(orderBook.bids).map(Number);
+
+    return {
+      bestAsk: askPrices.length > 0 ? Math.min(...askPrices) : null,
+      bestBid: bidPrices.length > 0 ? Math.max(...bidPrices) : null,
+    };
+  }, [orderBook]);
+
+  const maxDollarVolume = useMemo(() => {
+    let max = 0;
+
+    Object.entries(orderBook.asks).forEach(([p, v]) => {
+      const dol = parseFloat(p) * v;
+      if (dol > max) max = dol;
+    });
+
+    Object.entries(orderBook.bids).forEach(([p, v]) => {
+      const dol = parseFloat(p) * v;
+      if (dol > max) max = dol;
+    });
+
+    return max || 1;
+  }, [orderBook]);
+
+  const priceLevels = useMemo(() => {
+    if (!fixedAnchorPrice || fixedAnchorPrice <= 0 || tickStep <= 0) {
+      return [];
+    }
+
+    const basePrice = Math.floor(fixedAnchorPrice / tickStep) * tickStep;
+    const levels = [];
+    const totalLevels = 2000;
+
+    for (let i = totalLevels; i >= -totalLevels; i--) {
+      const price = parseFloat(
+        (basePrice + i * tickStep).toFixed(precision)
+      );
+
+      if (price <= 0) continue;
+
+      const priceStr = price.toFixed(precision);
+      const isRoundLevel =
+        priceStr.endsWith('00') ||
+        priceStr.endsWith('50') ||
+        priceStr.endsWith('0');
+
+      levels.push({
+        price: priceStr,
+        rawPrice: price,
+        isRoundLevel,
+        index: totalLevels - i,
+      });
+    }
+
+    return levels;
+  }, [fixedAnchorPrice, tickStep, precision]);
+
+  const currentPriceIndex = useMemo(() => {
+    if (!currentPrice || priceLevels.length === 0) return -1;
+
+    return priceLevels.findIndex(
+      (l) => Math.abs(l.rawPrice - currentPrice) < tickStep / 2
+    );
+  }, [currentPrice, priceLevels, tickStep]);
+
+  const centerDom = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (domContainerRef.current && currentPriceIndex !== -1) {
+        const containerH = domContainerRef.current.clientHeight;
+
+        const targetScroll =
+          currentPriceIndex * ROW_HEIGHT -
+          containerH / 2 +
+          ROW_HEIGHT / 2;
+
+        domContainerRef.current.scrollTop = Math.max(0, targetScroll);
+      }
+    });
+  }, [currentPriceIndex]);
+
+  useEffect(() => {
+    if (autoCenter && currentPriceIndex !== -1) {
+      centerDom();
+      const frame = requestAnimationFrame(centerDom);
+      return () => cancelAnimationFrame(frame);
+    }
+  }, [symbol, currentPrice, autoCenter, centerDom, currentPriceIndex, activeTab]);
+
+  const handleScroll = (e) => {
+    setScrollTop(e.target.scrollTop);
+    if (autoCenter) {
+      setAutoCenter(false);
+    }
   };
-  const fmtPrice = (p) => {
-    if (p >= 1000) return p.toFixed(2);
-    if (p >= 1) return p.toFixed(4);
-    if (p >= 0.001) return p.toFixed(6);
-    return p.toFixed(8);
+
+  const totalHeight = priceLevels.length * ROW_HEIGHT;
+
+  const startIndex = Math.max(
+    0,
+    Math.floor(scrollTop / ROW_HEIGHT) - VISIBLE_BUFFER
+  );
+
+  const endIndex = Math.min(
+    priceLevels.length - 1,
+    Math.ceil((scrollTop + containerHeight) / ROW_HEIGHT) +
+      VISIBLE_BUFFER
+  );
+
+  const visibleRows = useMemo(() => {
+    const rows = [];
+
+    for (let i = startIndex; i <= endIndex; i++) {
+      const level = priceLevels[i];
+      if (!level) continue;
+
+      const price = level.rawPrice;
+      let askDollarVolume = 0;
+      let bidDollarVolume = 0;
+
+      Object.entries(orderBook.asks).forEach(([pStr, vol]) => {
+        const p = parseFloat(pStr);
+        if (p >= price && p < price + tickStep) {
+          askDollarVolume += p * vol;
+        }
+      });
+
+      Object.entries(orderBook.bids).forEach(([pStr, vol]) => {
+        const p = parseFloat(pStr);
+        if (p <= price && p > price - tickStep) {
+          bidDollarVolume += p * vol;
+        }
+      });
+
+      rows.push({
+        ...level,
+        topOffset: i * ROW_HEIGHT,
+        askDollarVolume,
+        bidDollarVolume,
+        isCurrentLevel: i === currentPriceIndex,
+        isBestAsk: bestAsk && Math.abs(price - bestAsk) < tickStep / 2,
+        isBestBid: bestBid && Math.abs(price - bestBid) < tickStep / 2,
+      });
+    }
+
+    return rows;
+  }, [
+    priceLevels,
+    startIndex,
+    endIndex,
+    orderBook,
+    tickStep,
+    currentPriceIndex,
+    bestAsk,
+    bestBid,
+  ]);
+
+  const applyPercentValue = () => {
+    const val = parseFloat(inputValue);
+    if (!isNaN(val) && val > 0) {
+      setPriceStepPercent(val);
+      setInputValue(val.toString());
+      setFixedAnchorPrice(currentPrice);
+      setAutoCenter(true);
+    }
   };
-  const fmtHour = (ts) => new Date(ts).toLocaleTimeString("ro-RO", { hour: "2-digit", minute: "2-digit" });
-  const ratioColor = (r) => r >= 25 ? "#ff4d4d" : r >= 15 ? "#ff8c00" : r >= 10 ? "#ffd700" : "#00e676";
-  const ratioBg = (r) => r >= 25 ? "rgba(255,77,77,0.10)" : r >= 15 ? "rgba(255,140,0,0.10)"
-    : r >= 10 ? "rgba(255,215,0,0.10)" : "rgba(0,230,118,0.08)";
-  const openTV = (sym) => window.open(`https://www.tradingview.com/chart/?symbol=BINANCE%3A${sym}`, "_blank");
 
-  const notifyCount = movers.filter(m => m.notifyWorthy).length;
-  const starDist = [4, 3, 2, 1, 0].map(n => ({
-    n, count: movers.filter(m => m.stars === n).length
-  })).filter(s => s.count > 0);
+  const applyMinLiquidity = () => {
+    const val = parseFloat(minLiquidityInput);
+    if (!isNaN(val) && val >= 0) {
+      setMinLiquidityUsd(val);
+    } else {
+      setMinLiquidityInput(minLiquidityUsd.toString());
+    }
+  };
 
-  // ── Render ───────────────────────────────────────────────────────────────
+  const calculateDistancePercent = (targetPrice) => {
+    if (!currentPrice || currentPrice === 0) return '0.00%';
+    const diff = ((parseFloat(targetPrice) - currentPrice) / currentPrice) * 100;
+    return `${diff > 0 ? '+' : ''}${diff.toFixed(2)}%`;
+  };
+
   return (
-    <div style={{
-      minHeight: "100vh", background: "#0a0c10", color: "#e2e8f0",
-      fontFamily: "'JetBrains Mono','Fira Code',monospace", padding: "24px",
-    }}>
-      <div style={{
-        position: "fixed", inset: 0, zIndex: 0, pointerEvents: "none",
-        background: "radial-gradient(ellipse 80% 50% at 50% -20%, rgba(0,230,118,0.07) 0%, transparent 60%)",
-      }} />
-
-      <div style={{ position: "relative", zIndex: 1, maxWidth: 1260, margin: "0 auto" }}>
-
-        {/* ── Header ── */}
-        <div style={{ marginBottom: 24 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 6 }}>
-            <Activity size={26} color="#00e676" />
-            <h1 style={{ fontSize: 24, fontWeight: 800, letterSpacing: "-0.5px", color: "#fff", margin: 0 }}>
-              High Volume Bars
-            </h1>
-            <span style={{
-              fontSize: 10, borderRadius: 4, padding: "2px 8px",
-              background: "rgba(0,230,118,0.15)", color: "#00e676",
-              border: "1px solid rgba(0,230,118,0.3)",
-            }}>FUTURES 1H</span>
-          </div>
-        </div>
-
-        {/* ── Stat cards ── */}
-        <div style={{
-          display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(145px, 1fr))",
-          gap: 10, marginBottom: 14,
-        }}>
-          <div style={cardStyle}>
-            <p style={labelStyle}>SCANATE</p>
-            <p style={bigNumStyle}>{totalScanned || "—"}</p>
-            <p style={subLabelStyle}>simboluri futures</p>
-          </div>
-
-          <div style={cardStyle}>
-            <p style={labelStyle}>ÎN LISTĂ</p>
-            <p style={{ ...bigNumStyle, color: "#00e676" }}>{movers.length}</p>
-            <p style={subLabelStyle}>trec toate filtrele</p>
-          </div>
-
-          <div style={cardStyle}>
-            <p style={labelStyle}>DISTRIBUȚIE ★</p>
-            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-              {starDist.length === 0 ? (
-                <span style={{ color: "#334155", fontSize: 12 }}>—</span>
-              ) : starDist.map(({ n, count }) => (
-                <div key={n} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                  <span style={{ color: starsColor(n), fontSize: 11, minWidth: 50, letterSpacing: n > 0 ? 2 : 0 }}>
-                    {n > 0 ? "★".repeat(n) : "fără ★"}
-                  </span>
-                  <span style={{ color: "#64748b", fontSize: 11, background: "#1a1e27", borderRadius: 4, padding: "1px 6px" }}>
-                    {count}
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-
-          <div style={cardStyle}>
-            <p style={labelStyle}>ULTIMA SCANARE</p>
-            <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 10 }}>
-              <Clock size={13} color="#64748b" />
-              <span style={{ fontSize: 12, color: "#cbd5e1" }}>{lastUpdate || "—"}</span>
-            </div>
+    <div className="flex flex-col h-screen w-full bg-[#0b0e14] text-gray-200 font-sans overflow-hidden">
+      {/* Topbar / Header */}
+      <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between p-2 md:px-4 md:py-2 bg-[#121620] border-b border-gray-800 gap-2 select-none">
+        <div className="flex items-center justify-between md:justify-start gap-2 md:gap-4 overflow-x-auto">
+          {/* Căutare Simbol */}
+          <div className="relative">
             <button
-              onClick={runScan} disabled={isLoading}
-              style={{
-                background: isLoading ? "#1a1e27" : "rgba(0,230,118,0.1)",
-                border: "1px solid rgba(0,230,118,0.3)",
-                color: "#00e676", borderRadius: 6, padding: "5px 12px",
-                fontSize: 11, cursor: isLoading ? "not-allowed" : "pointer",
-                display: "flex", alignItems: "center", gap: 6, fontFamily: "inherit",
-              }}
+              onClick={() => setIsSearchOpen(!isSearchOpen)}
+              className="flex items-center gap-1.5 bg-[#1a202c] hover:bg-[#2d3748] px-2.5 py-1 md:px-3 md:py-1.5 rounded text-xs md:text-sm font-semibold text-white border border-gray-700 whitespace-nowrap"
             >
-              <RefreshCw size={11} style={{ animation: isLoading ? "spin 1s linear infinite" : "none" }} />
-              RESCANEAZĂ
+              <span>{symbol}</span>
+              <span className="text-[10px] text-gray-400">▼</span>
             </button>
-          </div>
-        </div>
 
-
-        {/* ── Loading ── */}
-        {isLoading && (
-          <div style={{ background: "#111318", border: "1px solid #1e2330", borderRadius: 12, padding: "52px 24px", textAlign: "center" }}>
-            <Zap size={34} color="#00e676" style={{ margin: "0 auto 14px", display: "block", animation: "pulse 1.2s ease-in-out infinite" }} />
-            <p style={{ color: "#94a3b8", fontSize: 13, marginBottom: 18 }}>
-              Loading · {totalScanned > 0 ? `${totalScanned} simboluri` : ""}
-            </p>
-            <div style={{ background: "#1a1e27", borderRadius: 999, height: 5, width: 260, margin: "0 auto", overflow: "hidden" }}>
-              <div style={{
-                height: "100%", borderRadius: 999,
-                background: "linear-gradient(90deg, #00e676, #69f0ae)",
-                width: `${scanProgress}%`, transition: "width 0.35s ease",
-              }} />
-            </div>
-            <p style={{ color: "#334155", fontSize: 11, marginTop: 8 }}>{scanProgress}%</p>
-          </div>
-        )}
-
-        {/* ── Error ── */}
-        {error && !isLoading && (
-          <div style={{
-            background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.3)",
-            borderRadius: 12, padding: "20px 24px", display: "flex", alignItems: "center", gap: 12,
-          }}>
-            <AlertTriangle size={18} color="#ef4444" />
-            <p style={{ color: "#ef4444", margin: 0, fontSize: 13 }}>{error}</p>
-          </div>
-        )}
-
-        {/* ── Results ── */}
-        {!isLoading && !error && (
-          <div style={{ background: "#111318", border: "1px solid #1e2330", borderRadius: 12, overflow: "hidden" }}>
-            <div style={{
-              padding: "14px 20px", borderBottom: "1px solid #1e2330",
-              display: "flex", alignItems: "center", justifyContent: "space-between",
-            }}>
-              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                <BarChart2 size={15} color="#00e676" />
-                <span style={{ fontSize: 12, color: "#94a3b8" }}>
-                  {movers.length} monede
-                </span>
-              </div>
-              <span style={{ fontSize: 10, color: "#2d3348" }}>hover ⓘ → condiții · click → TradingView</span>
-            </div>
-
-            {movers.length === 0 ? (
-              <div style={{ padding: "64px 24px", textAlign: "center" }}>
-                <TrendingUp size={38} color="#1e2330" style={{ margin: "0 auto 14px", display: "block" }} />
-                <p style={{ color: "#475569", fontSize: 14, marginBottom: 6 }}>
-                  Nicio monedă nu îndeplinește toate filtrele în acest moment.
-                </p>
-              </div>
-            ) : (
-              <div style={{ overflowX: "auto" }}>
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr style={{ background: "#0d1017" }}>
-                      {["#", "Simbol", "★", "Ratio", "Vol. Curent", "Preț", "Variație", "Oră"].map((h, i) => (
-                        <th key={i} style={{
-                          padding: "11px 14px",
-                          textAlign: i <= 2 ? "left" : "right",
-                          fontSize: 10, color: "#475569", fontWeight: 600,
-                          letterSpacing: "0.05em", whiteSpace: "nowrap",
-                        }}>{h}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {movers.map((coin, idx) => {
-                      const rc = ratioColor(coin.ratio);
-                      const rb = ratioBg(coin.ratio);
-                      const pc = coin.priceChange >= 0 ? "#00e676" : "#ef4444";
-                      return (
-                        <tr
-                          key={coin.fullSymbol}
-                          onClick={() => openTV(coin.fullSymbol)}
-                          style={{
-                            background: coin.notifyWorthy ? "rgba(255,77,77,0.04)"
-                              : idx % 2 === 0 ? "transparent" : "rgba(255,255,255,0.012)",
-                            borderBottom: "1px solid #1a1e27",
-                            borderLeft: coin.notifyWorthy ? "2px solid #FF4D4D" : "2px solid transparent",
-                            cursor: "pointer", transition: "background 0.15s",
-                          }}
-                          onMouseEnter={e => e.currentTarget.style.background = "rgba(0,230,118,0.045)"}
-                          onMouseLeave={e => e.currentTarget.style.background = coin.notifyWorthy ? "rgba(255,77,77,0.04)" : (idx % 2 === 0 ? "transparent" : "rgba(255,255,255,0.012)")}
-                        >
-                          {/* rank */}
-                          <td style={{ padding: "11px 14px", color: "#2d3348", fontSize: 11 }}>{idx + 1}</td>
-
-                          {/* symbol */}
-                          <td style={{ padding: "11px 14px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                              <div style={{
-                                width: 34, height: 34, background: rb,
-                                border: `1px solid ${rc}30`, borderRadius: 8,
-                                display: "flex", alignItems: "center", justifyContent: "center",
-                                fontSize: 9, fontWeight: 700, color: rc, flexShrink: 0,
-                              }}>
-                                {coin.symbol.slice(0, 4)}
-                              </div>
-                              
-                            </div>
-                          </td>
-
-                          {/* stars + tooltip */}
-                          <td style={{ padding: "11px 14px" }}>
-                            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                              <StarsBadge count={coin.stars} />
-                              <StarsTooltip flags={coin.flags} />
-                            </div>
-                          </td>
-
-                          {/* ratio */}
-                          <td style={{ padding: "11px 14px", textAlign: "right" }}>
-                            <div style={{
-                              display: "inline-flex", alignItems: "center", gap: 4,
-                              background: rb, border: `1px solid ${rc}40`,
-                              borderRadius: 6, padding: "4px 9px",
-                            }}>
-                              <ArrowUpRight size={13} color={rc} />
-                              <span style={{ color: rc, fontWeight: 800, fontSize: 14 }}>x{coin.ratio.toFixed(1)}</span>
-                            </div>
-                          </td>
-
-                          {/* vol curent */}
-                          <td style={{ padding: "11px 14px", textAlign: "right", color: "#f1f5f9", fontWeight: 700, fontSize: 12 }}>
-                            ${fmtVol(coin.currQuoteVol)}
-                          </td>
-
-                          {/* pret */}
-                          <td style={{ padding: "11px 14px", textAlign: "right", color: "#e2e8f0", fontWeight: 600, fontSize: 12 }}>
-                            ${fmtPrice(coin.closePrice)}
-                          </td>
-
-                          {/* variatie */}
-                          <td style={{ padding: "11px 14px", textAlign: "right" }}>
-                            <span style={{ color: pc, fontSize: 12, fontWeight: 600 }}>
-                              {coin.priceChange >= 0 ? "+" : ""}{coin.priceChange.toFixed(2)}%
-                            </span>
-                          </td>
-
-                          {/* ora */}
-                          <td style={{ padding: "11px 14px", textAlign: "right", color: "#334155", fontSize: 11 }}>
-                            {fmtHour(coin.openTime)}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
+            {isSearchOpen && (
+              <div className="absolute left-0 top-full mt-1 w-56 md:w-64 bg-[#181a20] border border-gray-700 rounded shadow-2xl z-50">
+                <input
+                  type="text"
+                  placeholder="Căutare..."
+                  value={searchSymbol}
+                  onChange={(e) => setSearchSymbol(e.target.value)}
+                  className="w-full bg-[#0d0e12] px-3 py-2 text-sm text-white focus:outline-none border-b border-gray-700"
+                  autoFocus
+                />
+                <div className="max-h-60 overflow-y-auto">
+                  {symbolsList
+                    .filter((s) => s.toLowerCase().includes(searchSymbol.toLowerCase()))
+                    .slice(0, 50)
+                    .map((sym) => (
+                      <div
+                        key={sym}
+                        onClick={() => {
+                          setSymbol(sym);
+                          setIsSearchOpen(false);
+                          setSearchSymbol('');
+                        }}
+                        className="px-3 py-2 text-sm hover:bg-[#2b2f3e] cursor-pointer"
+                      >
+                        {sym}
+                      </div>
+                    ))}
+                </div>
               </div>
             )}
           </div>
-        )}
 
+          {/* Timeframes */}
+          <div className="flex gap-0.5 md:gap-1 bg-[#181a20] p-1 rounded border border-gray-800">
+            {TIMEFRAMES.map((tf) => (
+              <button
+                key={tf.value}
+                onClick={() => setTimeframe(tf.value)}
+                className={`px-2 py-0.5 md:px-2.5 md:py-1 text-[11px] md:text-xs font-medium rounded ${
+                  timeframe === tf.value
+                    ? 'bg-[#2b2f3e] text-white'
+                    : 'text-gray-400 hover:text-white'
+                }`}
+              >
+                {tf.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Setări Lichiditate și Afișare Preț */}
+        <div className="flex items-center justify-between md:justify-end gap-2 text-xs">
+          <div className="flex items-center gap-1.5 bg-[#181a20] px-2 py-1 rounded border border-gray-800">
+            <button
+              onClick={() => setShowLiquidity((prev) => !prev)}
+              className={`px-2 py-0.5 text-[10px] md:text-xs font-semibold rounded ${
+                showLiquidity ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-400'
+              }`}
+            >
+              {showLiquidity ? 'Heatmap: ON' : 'Heatmap: OFF'}
+            </button>
+
+            {/* Buton comutator Liquidity Sweeps */}
+            <button
+              onClick={() => setShowSweeps((prev) => !prev)}
+              className={`px-2 py-0.5 text-[10px] md:text-xs font-semibold rounded ${
+                showSweeps ? 'bg-amber-600 text-white' : 'bg-gray-700 text-gray-400'
+              }`}
+            >
+              {showSweeps ? '⚡ Sweeps: ON' : '⚡ Sweeps: OFF'}
+            </button>
+
+            <div className="flex items-center gap-1 text-[10px] md:text-xs text-gray-400 pl-1 border-l border-gray-700">
+              <span>Min USD:</span>
+              <input
+                type="text"
+                value={minLiquidityInput}
+                onChange={(e) => setMinLiquidityInput(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && applyMinLiquidity()}
+                onBlur={applyMinLiquidity}
+                className="w-14 md:w-20 bg-[#0d0e12] border border-gray-700 rounded px-1 py-0.5 text-center text-white text-[11px] font-bold focus:outline-none"
+              />
+            </div>
+          </div>
+
+          {currentPrice && (
+            <div className="text-[11px] md:text-sm font-mono whitespace-nowrap">
+              <span className="text-green-400 font-bold">${currentPrice}</span>
+            </div>
+          )}
+        </div>
       </div>
 
-      <style>{`
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
-      `}</style>
+      {/* Comutator de Tab-uri Vizibil Doar pe Mobil */}
+      <div className="flex md:hidden bg-[#181d2a] border-b border-gray-800">
+        <button
+          onClick={() => setActiveTab('chart')}
+          className={`flex-1 py-2 text-center text-xs font-bold transition-colors ${
+            activeTab === 'chart'
+              ? 'bg-[#2b2f3e] text-white border-b-2 border-blue-500'
+              : 'text-gray-400'
+          }`}
+        >
+          📈 Grafic & Heatmap
+        </button>
+        <button
+          onClick={() => setActiveTab('dom')}
+          className={`flex-1 py-2 text-center text-xs font-bold transition-colors ${
+            activeTab === 'dom'
+              ? 'bg-[#2b2f3e] text-white border-b-2 border-blue-500'
+              : 'text-gray-400'
+          }`}
+        >
+          📊 DOM (Order Book)
+        </button>
+      </div>
+
+      {/* Zona Principală de Conținut */}
+      <div className="flex flex-1 overflow-hidden relative">
+        {/* TAB 1: Grafic + Heatmap Overlay */}
+        <div
+          className={`flex-1 relative border-r border-gray-800 h-full ${
+            activeTab === 'chart' ? 'block' : 'hidden md:block'
+          }`}
+        >
+          <div className="absolute top-2 left-2 z-20 text-sm md:text-xl font-bold text-gray-400 opacity-40 pointer-events-none select-none">
+            {symbol} • {timeframe}
+          </div>
+
+          {showLiquidity && (
+            <div className="absolute bottom-2 left-2 z-20 flex items-center gap-2 bg-[#121620]/80 backdrop-blur px-2 py-1 rounded border border-gray-800 text-[9px] md:text-[10px] text-gray-300">
+              <span className="font-bold text-yellow-400">
+                Min. ≥ ${minLiquidityUsd.toLocaleString()}
+              </span>
+              <div className="w-12 md:w-16 h-2 rounded bg-gradient-to-r from-[rgb(255,140,0)] to-[rgb(220,38,38)]" />
+            </div>
+          )}
+
+          <div ref={chartContainerRef} className="w-full h-full relative" />
+          <canvas
+            ref={chartCanvasOverlayRef}
+            className="absolute top-0 left-0 pointer-events-none z-10"
+          />
+        </div>
+
+        {/* TAB 2: DOM / Order Book */}
+        <div
+          className={`w-full md:w-80 bg-[#11141c] flex flex-col font-mono text-xs select-none relative h-full ${
+            activeTab === 'dom' ? 'flex' : 'hidden md:flex'
+          }`}
+        >
+          <div className="px-3 py-2 bg-[#171c28] border-b border-gray-800 flex justify-between items-center text-gray-400 text-[11px]">
+            <span>Pas Preț (%):</span>
+            <div className="flex items-center gap-1">
+              <input
+                type="text"
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onKeyDown={(e) => e.key === 'Enter' && applyPercentValue()}
+                onBlur={applyPercentValue}
+                className="w-16 bg-[#0b0e14] border border-gray-700 rounded px-1 py-0.5 text-center text-white font-bold focus:outline-none"
+              />
+              <span>%</span>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 bg-[#181d2a] border-b border-gray-800 text-[10px] text-gray-400 py-1.5 px-3 font-bold">
+            <span className="text-left">VOLUM ($)</span>
+            <span className="text-right">PREȚ</span>
+          </div>
+
+          {!autoCenter && (
+            <button
+              onClick={() => {
+                setAutoCenter(true);
+                centerDom();
+              }}
+              className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-blue-600 hover:bg-blue-500 text-white text-[10px] px-3 py-1.5 rounded-full shadow-lg z-30 font-bold"
+            >
+              Centrare
+            </button>
+          )}
+
+          <div
+            ref={domContainerRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto relative scrollbar-none [scrollbar-width:none]"
+          >
+            <style>{`div::-webkit-scrollbar { display: none; }`}</style>
+
+            <div
+              style={{
+                height: `${totalHeight}px`,
+                position: 'relative',
+                width: '100%',
+              }}
+            >
+              {visibleRows.map((row) => {
+                const isHovered = hoveredPrice === row.price;
+
+                const isAsk =
+                  row.askDollarVolume > 0 ||
+                  (currentPrice && row.rawPrice > currentPrice);
+
+                const dollarVal = isAsk ? row.askDollarVolume : row.bidDollarVolume;
+
+                const barWidth = dollarVal
+                  ? `${Math.min(100, (dollarVal / maxDollarVolume) * 100)}%`
+                  : '0%';
+
+                let rowBgStyle = 'bg-[#141822]';
+                let priceTextColor = isAsk ? 'text-red-400' : 'text-green-400';
+
+                if (row.isBestAsk) {
+                  rowBgStyle = 'bg-[#5b1924]';
+                  priceTextColor = 'text-red-300 font-bold';
+                } else if (row.isBestBid) {
+                  rowBgStyle = 'bg-[#124d2d]';
+                  priceTextColor = 'text-green-300 font-bold';
+                }
+
+                if (row.isCurrentLevel) {
+                  rowBgStyle = 'bg-yellow-600/40';
+                  priceTextColor = 'text-yellow-300 font-bold';
+                }
+
+                return (
+                  <div
+                    key={row.price}
+                    onMouseEnter={() => setHoveredPrice(row.price)}
+                    onMouseLeave={() => setHoveredPrice(null)}
+                    style={{
+                      position: 'absolute',
+                      top: `${row.topOffset}px`,
+                      left: 0,
+                      right: 0,
+                      height: `${ROW_HEIGHT}px`,
+                    }}
+                    className={`grid grid-cols-2 items-center px-3 border-b border-gray-900/60 cursor-pointer hover:brightness-125 ${rowBgStyle}`}
+                  >
+                    <div className="relative h-full flex items-center justify-start overflow-hidden">
+                      <div
+                        className={`absolute left-0 top-0 bottom-0 pointer-events-none opacity-30 ${
+                          isAsk ? 'bg-red-500' : 'bg-green-500'
+                        }`}
+                        style={{ width: barWidth }}
+                      />
+                      <span
+                        className={`text-[11px] font-semibold z-10 relative ${
+                          isAsk ? 'text-red-300' : 'text-green-300'
+                        }`}
+                      >
+                        {formatDollarVolume(dollarVal)}
+                      </span>
+                    </div>
+
+                    <div className="text-right h-full flex items-center justify-end">
+                      <span className={`text-[11px] ${priceTextColor}`}>
+                        {isHovered ? (
+                          <span className="text-yellow-300 font-bold">
+                            {calculateDistancePercent(row.price)}
+                          </span>
+                        ) : (
+                          row.price
+                        )}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   );
-};
-
-const cardStyle = { background: "#111318", border: "1px solid #1e2330", borderRadius: 10, padding: "14px 16px" };
-const labelStyle = { color: "#475569", fontSize: 10, fontWeight: 600, letterSpacing: "0.06em", marginBottom: 8, marginTop: 0 };
-const bigNumStyle = { fontSize: 26, fontWeight: 700, color: "#fff", margin: 0 };
-const subLabelStyle = { color: "#334155", fontSize: 10, margin: 0, marginTop: 2 };
-
-export default HighVolumeBar;
+}

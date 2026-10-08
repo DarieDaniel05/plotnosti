@@ -19,7 +19,7 @@ function App() {
           element={<Coins onSelectSymbol={setSelectedSymbol} />}
         />
         <Route path="/plotnosti" element={<FuturesPage />} />
-        <Route path="/dailyHighMove" element={<DailyHighMovePage />} />
+        <Route path="/dailyHighMove" element={<DailyHighMovePage symbol="BTCUSDT" onClose={() => setSelectedSymbol(null)} />} />
         <Route path="/highVolumeBar" element={<HighVolumeBar />} />
       </Routes>
 
