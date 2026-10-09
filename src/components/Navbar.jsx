@@ -16,7 +16,7 @@ const Navbar = () => {
             to="/"
             className="text-xl font-semibold hover:text-green-400 transition-colors"
           >
-            Coins
+            Liquidity map
           </Link>
           <Link
             to="/dailyHighMove"
@@ -25,10 +25,10 @@ const Navbar = () => {
             Daily High Move
           </Link>
           <Link
-            to="/highVolumeBar"
+            to="/coins"
             className="text-xl font-semibold hover:text-green-400 transition-colors"
           >
-            Liquidity map
+            Coins
           </Link>
         </div>
       </div>

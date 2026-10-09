@@ -21,7 +21,12 @@ const formatDollarVolume = (valInDollars) => {
 };
 
 export default function DeepLiquidityHeatmapChart() {
-  const [symbol, setSymbol] = useState('OGNUSDT');
+  const [symbol, setSymbol] = useState(() => localStorage.getItem('hv_symbol') || 'OGNUSDT');
+
+  // Persistenta simbol — salveaza in localStorage la fiecare schimbare
+  useEffect(() => {
+    localStorage.setItem('hv_symbol', symbol);
+  }, [symbol]);
   const [searchSymbol, setSearchSymbol] = useState('');
   const [symbolsList, setSymbolsList] = useState([]);
   const [timeframe, setTimeframe] = useState('1m');
@@ -108,7 +113,6 @@ export default function DeepLiquidityHeatmapChart() {
     const ob = localOrderBookRef.current;
     const currentActive = {};
 
-    // Retinem separat ask-urile si bid-urile cu lichiditate suficienta
     const activeAskLevels = {};
     Object.entries(ob.asks).forEach(([pStr, vol]) => {
       const p = parseFloat(pStr);
@@ -129,52 +133,33 @@ export default function DeepLiquidityHeatmapChart() {
       }
     });
 
-    // Sweep DOAR cand pretul curent atinge efectiv nivelul de lichiditate.
-    // Nu mai folosim high/low al lumanarii — un wick care trece prin nivel
-    // nu inseamna ca pretul curent a atins acel nivel.
+    // Sweep DOAR cand pretul curent atinge efectiv nivelul de lichiditate
     if (latestPrice) {
       const now = Date.now();
 
-      // BUY SWEEP: pretul a urcat si a atins/depasit un nivel de ask (rezistenta)
+      // BUY SWEEP: pretul a urcat si a atins/depasit un nivel de ask
       Object.keys(activeAskLevels).forEach((pStr) => {
         const p = parseFloat(pStr);
         if (latestPrice >= p) {
           const sweptVolume = activeAskLevels[p];
-          sweptLiquidityRef.current.push({
-            price: p,
-            volume: sweptVolume,
-            timestamp: now,
-            type: 'BUY_SWEEP',
-          });
-          if (currentCandleRef.current) {
-            addSweepMarker(currentCandleRef.current.time, p, 'BUY_SWEEP', sweptVolume);
-          }
+          sweptLiquidityRef.current.push({ price: p, volume: sweptVolume, timestamp: now, type: 'BUY_SWEEP' });
+          if (currentCandleRef.current) addSweepMarker(currentCandleRef.current.time, p, 'BUY_SWEEP', sweptVolume);
           delete currentActive[p];
         }
       });
 
-      // SELL SWEEP: pretul a coborat si a atins/depasit un nivel de bid (suport)
+      // SELL SWEEP: pretul a coborat si a atins/depasit un nivel de bid
       Object.keys(activeBidLevels).forEach((pStr) => {
         const p = parseFloat(pStr);
         if (latestPrice <= p) {
           const sweptVolume = activeBidLevels[p];
-          sweptLiquidityRef.current.push({
-            price: p,
-            volume: sweptVolume,
-            timestamp: now,
-            type: 'SELL_SWEEP',
-          });
-          if (currentCandleRef.current) {
-            addSweepMarker(currentCandleRef.current.time, p, 'SELL_SWEEP', sweptVolume);
-          }
+          sweptLiquidityRef.current.push({ price: p, volume: sweptVolume, timestamp: now, type: 'SELL_SWEEP' });
+          if (currentCandleRef.current) addSweepMarker(currentCandleRef.current.time, p, 'SELL_SWEEP', sweptVolume);
           delete currentActive[p];
         }
       });
 
-      // Pastreaza doar sweep-urile din ultimele 15 secunde
-      sweptLiquidityRef.current = sweptLiquidityRef.current.filter(
-        (s) => now - s.timestamp < 15000
-      );
+      sweptLiquidityRef.current = sweptLiquidityRef.current.filter((s) => now - s.timestamp < 15000);
     }
 
     activeLiquidityRef.current = currentActive;
@@ -825,6 +810,19 @@ export default function DeepLiquidityHeatmapChart() {
     }
   }, [symbol, currentPrice, autoCenter, centerDom, currentPriceIndex, activeTab]);
 
+  // Space = centrare DOM
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code === 'Space' && e.target.tagName !== 'INPUT') {
+        e.preventDefault();
+        setAutoCenter(true);
+        centerDom();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [centerDom]);
+
   const handleScroll = (e) => {
     setScrollTop(e.target.scrollTop);
     if (autoCenter) {
@@ -954,136 +952,51 @@ export default function DeepLiquidityHeatmapChart() {
       const filtered = symbolsList
         .filter((s) => s.includes(q))
         .sort((a, b) => {
-          const aStarts = a.startsWith(q), bStarts = b.startsWith(q);
-          if (aStarts && !bStarts) return -1;
-          if (!aStarts && bStarts) return 1;
+          const aS = a.startsWith(q), bS = b.startsWith(q);
+          if (aS && !bS) return -1;
+          if (!aS && bS) return 1;
           return a.localeCompare(b);
         })
         .slice(0, 50);
-
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        setSelectedIdx((i) => Math.min(i + 1, filtered.length - 1));
-      } else if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        setSelectedIdx((i) => Math.max(i - 1, -1));
-      } else if (e.key === 'Escape') {
-        setIsSearchOpen(false);
-        setSearchSymbol('');
-        setSelectedIdx(-1);
-        e.target.blur();
-      } else if (e.key === 'Enter') {
+      if (e.key === 'ArrowDown') { e.preventDefault(); setSelectedIdx((i) => Math.min(i + 1, filtered.length - 1)); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); setSelectedIdx((i) => Math.max(i - 1, -1)); }
+      else if (e.key === 'Escape') { setIsSearchOpen(false); setSearchSymbol(''); setSelectedIdx(-1); e.target.blur(); }
+      else if (e.key === 'Enter') {
         const pick = selectedIdx >= 0 ? filtered[selectedIdx] : filtered[0];
-        if (pick) {
-          setSymbol(pick);
-          setIsSearchOpen(false);
-          setSearchSymbol('');
-          setSelectedIdx(-1);
-          e.target.blur();
-        }
+        if (pick) { setSymbol(pick); setIsSearchOpen(false); setSearchSymbol(''); setSelectedIdx(-1); e.target.blur(); }
       }
     }}
-    onBlur={() => {
-      setTimeout(() => { setIsSearchOpen(false); setSelectedIdx(-1); }, 180);
-    }}
+    onBlur={() => { setTimeout(() => { setIsSearchOpen(false); setSelectedIdx(-1); }, 180); }}
     className="w-36 md:w-40 bg-[#1a202c] hover:bg-[#2d3748] px-3 py-1.5 rounded text-xs md:text-sm font-semibold text-white border border-gray-700 focus:border-blue-500 focus:outline-none"
   />
-
   {isSearchOpen && (() => {
     const q = searchSymbol.trim().toUpperCase();
     const filtered = symbolsList
       .filter((s) => s.includes(q))
       .sort((a, b) => {
-        const aStarts = a.startsWith(q), bStarts = b.startsWith(q);
-        if (aStarts && !bStarts) return -1;
-        if (!aStarts && bStarts) return 1;
+        const aS = a.startsWith(q), bS = b.startsWith(q);
+        if (aS && !bS) return -1; if (!aS && bS) return 1;
         return a.localeCompare(b);
       })
       .slice(0, 50);
-
     return (
-      <div
-        style={{
-          position: 'fixed',
-          top: dropdownPos.top,
-          left: dropdownPos.left,
-          width: dropdownPos.width,
-          zIndex: 99999,
-        }}
-      >
-        <div
-          style={{
-            background: '#181a20',
-            border: '1px solid #374151',
-            borderRadius: 8,
-            boxShadow: '0 20px 40px rgba(0,0,0,0.7)',
-            overflow: 'hidden',
-            maxHeight: 260,
-            overflowY: 'auto',
-          }}
-        >
-          {symbolsList.length === 0 && (
-            <div style={{ padding: '10px 12px', fontSize: 12, color: '#9ca3af' }}>
-              Se încarcă simbolurile...
-            </div>
-          )}
-
-          {symbolsList.length > 0 && filtered.length === 0 && (
-            <div style={{ padding: '10px 12px', fontSize: 12, color: '#6b7280' }}>
-              Niciun simbol găsit pentru „{q}"
-            </div>
-          )}
-
+      <div style={{ position: 'fixed', top: dropdownPos.top, left: dropdownPos.left, width: dropdownPos.width, zIndex: 99999 }}>
+        <div style={{ background: '#181a20', border: '1px solid #374151', borderRadius: 8, boxShadow: '0 20px 40px rgba(0,0,0,0.7)', overflow: 'hidden', maxHeight: 260, overflowY: 'auto' }}>
+          {symbolsList.length === 0 && <div style={{ padding: '10px 12px', fontSize: 12, color: '#9ca3af' }}>Se încarcă simbolurile...</div>}
+          {symbolsList.length > 0 && filtered.length === 0 && <div style={{ padding: '10px 12px', fontSize: 12, color: '#6b7280' }}>Niciun simbol găsit pentru „{q}"</div>}
           {filtered.map((sym, idx) => {
-            const isActive = sym === symbol;
-            const isHighlighted = idx === selectedIdx;
-            const q2 = searchSymbol.trim().toUpperCase();
-            const matchStart = sym.indexOf(q2);
+            const isActive = sym === symbol, isHL = idx === selectedIdx;
+            const q2 = searchSymbol.trim().toUpperCase(), ms = sym.indexOf(q2);
             return (
-              <button
-                type="button"
-                key={sym}
+              <button type="button" key={sym}
                 onMouseDown={(e) => e.preventDefault()}
                 onMouseEnter={() => setSelectedIdx(idx)}
-                onClick={() => {
-                  setSymbol(sym);
-                  setIsSearchOpen(false);
-                  setSearchSymbol('');
-                  setSelectedIdx(-1);
-                }}
-                style={{
-                  width: '100%',
-                  textAlign: 'left',
-                  padding: '7px 12px',
-                  fontSize: 13,
-                  fontFamily: 'monospace',
-                  cursor: 'pointer',
-                  display: 'flex',
-                  alignItems: 'center',
-                  gap: 8,
-                  background: isHighlighted
-                    ? '#2b2f3e'
-                    : isActive
-                    ? 'rgba(59,130,246,0.15)'
-                    : 'transparent',
-                  color: isActive ? '#60a5fa' : '#e5e7eb',
-                  borderBottom: '1px solid rgba(255,255,255,0.04)',
-                }}
-              >
-                {q2 && matchStart >= 0 ? (
-                  <span>
-                    {sym.slice(0, matchStart)}
-                    <span style={{ color: '#facc15', fontWeight: 700 }}>
-                      {sym.slice(matchStart, matchStart + q2.length)}
-                    </span>
-                    {sym.slice(matchStart + q2.length)}
-                  </span>
-                ) : (
-                  <span>{sym}</span>
-                )}
-                {isActive && (
-                  <span style={{ marginLeft: 'auto', fontSize: 10, color: '#60a5fa' }}>✓</span>
-                )}
+                onClick={() => { setSymbol(sym); setIsSearchOpen(false); setSearchSymbol(''); setSelectedIdx(-1); }}
+                style={{ width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 13, fontFamily: 'monospace', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, background: isHL ? '#2b2f3e' : isActive ? 'rgba(59,130,246,0.15)' : 'transparent', color: isActive ? '#60a5fa' : '#e5e7eb', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
+                {q2 && ms >= 0
+                  ? <span>{sym.slice(0,ms)}<span style={{ color:'#facc15', fontWeight:700 }}>{sym.slice(ms,ms+q2.length)}</span>{sym.slice(ms+q2.length)}</span>
+                  : <span>{sym}</span>}
+                {isActive && <span style={{ marginLeft:'auto', fontSize:10, color:'#60a5fa' }}>✓</span>}
               </button>
             );
           })}

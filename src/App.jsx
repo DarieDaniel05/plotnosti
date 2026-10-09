@@ -16,11 +16,11 @@ function App() {
       <Routes>
         <Route
           path="/"
-          element={<Coins onSelectSymbol={setSelectedSymbol} />}
+          element={<HighVolumeBar />}
         />
         <Route path="/plotnosti" element={<FuturesPage />} />
         <Route path="/dailyHighMove" element={<DailyHighMovePage symbol="BTCUSDT" onClose={() => setSelectedSymbol(null)} />} />
-        <Route path="/highVolumeBar" element={<HighVolumeBar />} />
+        <Route path="/coins" element={<Coins onSelectSymbol={setSelectedSymbol} />} />
       </Routes>
 
       <TradingViewChart
