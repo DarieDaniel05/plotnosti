@@ -1495,7 +1495,11 @@ export default function DeepLiquidityHeatmapChart() {
   };
 
   return (
-    <div className="flex flex-col h-screen w-full bg-[#0b0e14] text-gray-200 font-sans overflow-hidden">
+    <div className={`flex flex-col w-full bg-[#0b0e14] text-gray-200 font-sans ${
+      activeTab === 'dom'
+        ? 'h-auto min-h-screen overflow-visible md:h-screen md:overflow-hidden'
+        : 'h-screen overflow-hidden'
+    }`}>
       {/* Topbar / Header */}
       <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between p-2 md:px-4 md:py-2 bg-[#121620] border-b border-gray-800 gap-2 select-none">
         <div className="flex items-center justify-between md:justify-start gap-2 md:gap-4 overflow-x-auto">
@@ -1726,7 +1730,11 @@ export default function DeepLiquidityHeatmapChart() {
       </div>
 
       {/* Zona Principală de Conținut */}
-      <div className="flex flex-1 overflow-hidden relative">
+      <div className={`flex overflow-hidden relative ${
+        activeTab === 'dom'
+          ? 'h-[90vh] flex-none md:h-auto md:flex-1'
+          : 'flex-1'
+      }`}>
         {/* TAB 1: Grafic + Heatmap Overlay */}
         <div
           className={`min-w-0 flex-1 relative border-r border-gray-800 h-full ${
@@ -1736,9 +1744,7 @@ export default function DeepLiquidityHeatmapChart() {
           <div className="absolute top-2 left-2 z-20 text-sm md:text-xl font-bold text-gray-400 opacity-40 pointer-events-none select-none">
             {symbol} • {timeframe}
           </div>
-          <div className="absolute top-2 right-2 z-20 rounded bg-[#121620]/80 px-2 py-1 text-[10px] text-gray-400 pointer-events-none">
-            Shift + click: start · Click: set end · Click: remove
-          </div>
+          
 
           {showLiquidity && (
             <div className="absolute bottom-2 left-2 z-20 flex items-center gap-2 bg-[#121620]/80 backdrop-blur px-2 py-1 rounded border border-gray-800 text-[9px] md:text-[10px] text-gray-300">
@@ -1759,7 +1765,7 @@ export default function DeepLiquidityHeatmapChart() {
         {/* TAB 2: DOM / Order Book */}
         <div
           style={{ '--dom-panel-width': `${domPanelWidth}px` }}
-          className={`w-full md:w-[var(--dom-panel-width)] md:min-w-[var(--dom-panel-width)] md:flex-none md:shrink-0 bg-[#11141c] flex flex-col font-mono text-xs select-none relative h-full ${
+          className={`w-full md:w-[var(--dom-panel-width)] md:min-w-[var(--dom-panel-width)] md:flex-none md:shrink-0 bg-[#11141c] flex flex-col font-mono text-[10px] md:text-xs select-none relative h-full ${
             activeTab === 'dom' ? 'flex' : 'hidden md:flex'
           }`}
         >
@@ -1773,7 +1779,7 @@ export default function DeepLiquidityHeatmapChart() {
           >
             <span className="h-12 w-1 rounded-full bg-gray-500/60 transition-colors hover:bg-blue-400" />
           </div>
-          <div className="px-3 py-2 bg-[#171c28] border-b border-gray-800 flex justify-between items-center text-gray-400 text-[11px]">
+          <div className="px-3 py-2 bg-[#171c28] border-b border-gray-800 flex justify-between items-center text-gray-400 text-[10px] md:text-[11px]">
             <span>Pas Preț (%):</span>
             <div className="flex items-center gap-1">
               <input
@@ -1934,7 +1940,7 @@ export default function DeepLiquidityHeatmapChart() {
                         style={{ width: barWidth }}
                       />
                       <span
-                        className={`text-[11px] font-semibold z-10 relative ${
+                        className={`text-[10px] md:text-[11px] font-semibold z-10 relative ${
                           isAsk ? 'text-red-300' : 'text-green-300'
                         }`}
                         title={isHovered
@@ -1948,7 +1954,7 @@ export default function DeepLiquidityHeatmapChart() {
                     </div>
 
                     <div className="text-right h-full min-w-0 flex items-center justify-end overflow-hidden">
-                      <span className={`text-[11px] ${priceTextColor}`}>
+                      <span className={`text-[10px] md:text-[11px] ${priceTextColor}`}>
                         {isHovered ? (
                           <span className="text-yellow-300 font-bold">
                             {calculateDistancePercent(row.price)}
