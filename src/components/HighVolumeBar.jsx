@@ -24,6 +24,7 @@ const VISIBLE_BUFFER = 10;
 const TRADE_FEED_DISPLAY_COUNT = 8;
 const DOM_COLUMN_MIN_WIDTHS = [48, 48, 80, 96];
 const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
+const LIQUIDITY_SWEEP_DISPLAY_MS = 15 * 1000;
 const DEFAULT_LARGE_TRADE_THRESHOLD_USD = 1000;
 const getClusterWindowStart = (timestamp) =>
   Math.floor(timestamp / CLUSTER_WINDOW_MS) * CLUSTER_WINDOW_MS;
@@ -150,6 +151,9 @@ export default function DeepLiquidityHeatmapChart() {
 
   // Tab activ pentru mobil: 'chart' sau 'dom'
   const [activeTab, setActiveTab] = useState('chart');
+  const [keepDomCentered, setKeepDomCentered] = useState(
+    () => localStorage.getItem('hv_dom_auto_center') !== 'false'
+  );
 
   // Stări pentru comutarea vizibilității și pragul de lichiditate minimă
   const [showLiquidity, setShowLiquidity] = useState(true);
@@ -176,6 +180,7 @@ export default function DeepLiquidityHeatmapChart() {
   const [fixedAnchorPrice, setFixedAnchorPrice] = useState(null);
 
   const [trades, setTrades] = useState([]);
+  const [sweptLiquidity, setSweptLiquidity] = useState([]);
   const [clusterData, setClusterData] = useState(() => ({
     windowStart: getClusterWindowStart(Date.now()),
     levels: new Map(),
@@ -218,6 +223,10 @@ export default function DeepLiquidityHeatmapChart() {
   }, [largeTradeThresholdUsd]);
 
   useEffect(() => {
+    localStorage.setItem('hv_dom_auto_center', String(keepDomCentered));
+  }, [keepDomCentered]);
+
+  useEffect(() => {
     let timerId;
     const scheduleNextReset = () => {
       const delay = CLUSTER_WINDOW_MS - (Date.now() % CLUSTER_WINDOW_MS);
@@ -249,7 +258,6 @@ export default function DeepLiquidityHeatmapChart() {
   const rulerRef = useRef(null);
   const rulerPhaseRef = useRef('idle');
   const priceLoadedForSymbolRef = useRef(null);
-  const initialCenterKeyRef = useRef(null);
   const currentCandleRef = useRef(null);
   const domContainerRef = useRef(null);
   const searchInputRef = useRef(null);
@@ -258,7 +266,26 @@ export default function DeepLiquidityHeatmapChart() {
 
   const localOrderBookRef = useRef({ bids: {}, asks: {} });
   const activeLiquidityRef = useRef({});
-  const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
+  const sweptLiquidityRef = useRef([]);
+  const previousLiquidityPriceRef = useRef(null);
+
+  useEffect(() => {
+    if (sweptLiquidity.length === 0) return undefined;
+
+    const nextExpiry = Math.min(
+      ...sweptLiquidity.map((sweep) => sweep.timestamp + LIQUIDITY_SWEEP_DISPLAY_MS)
+    );
+    const timeoutId = setTimeout(() => {
+      const now = Date.now();
+      const remainingSweeps = sweptLiquidityRef.current.filter(
+        (sweep) => now - sweep.timestamp < LIQUIDITY_SWEEP_DISPLAY_MS
+      );
+      sweptLiquidityRef.current = remainingSweeps;
+      setSweptLiquidity(remainingSweeps);
+    }, Math.max(0, nextExpiry - Date.now()));
+
+    return () => clearTimeout(timeoutId);
+  }, [sweptLiquidity]);
 
   useEffect(() => {
     const feedColumn = tradeFeedColumnRef.current;
@@ -433,33 +460,60 @@ export default function DeepLiquidityHeatmapChart() {
       }
     });
 
-    // Sweep DOAR cand pretul curent atinge efectiv nivelul de lichiditate
-    if (latestPrice) {
-      const now = Date.now();
+    const now = Date.now();
+    const previousSweeps = sweptLiquidityRef.current;
+    const recentSweeps = showSweeps
+      ? previousSweeps.filter(
+        (sweep) => now - sweep.timestamp < LIQUIDITY_SWEEP_DISPLAY_MS
+      )
+      : [];
+    let sweepsChanged = recentSweeps.length !== previousSweeps.length;
+    const previousPrice = previousLiquidityPriceRef.current;
+    const addSweep = (price, value, type) => {
+      const alreadySwept = recentSweeps.some(
+        (sweep) => sweep.price === price && sweep.type === type
+      );
+      if (alreadySwept) return;
 
-      // BUY SWEEP: pretul a urcat si a atins/depasit un nivel de ask
-      Object.keys(activeAskLevels).forEach((pStr) => {
-        const p = parseFloat(pStr);
-        if (latestPrice >= p) {
-          sweptLiquidityRef.current.push({ price: p, timestamp: now, type: 'BUY_SWEEP' });
-          delete currentActive[p];
+      recentSweeps.push({ price, value, timestamp: now, type });
+      sweepsChanged = true;
+    };
+
+    if (
+      showSweeps &&
+      Number.isFinite(latestPrice) &&
+      latestPrice > 0 &&
+      previousPrice !== null
+    ) {
+      Object.keys(activeAskLevels).forEach((priceString) => {
+        const price = Number(priceString);
+        if (previousPrice < price && latestPrice >= price) {
+          addSweep(price, activeAskLevels[priceString], 'BUY_SWEEP');
         }
       });
 
-      // SELL SWEEP: pretul a coborat si a atins/depasit un nivel de bid
-      Object.keys(activeBidLevels).forEach((pStr) => {
-        const p = parseFloat(pStr);
-        if (latestPrice <= p) {
-          sweptLiquidityRef.current.push({ price: p, timestamp: now, type: 'SELL_SWEEP' });
-          delete currentActive[p];
+      Object.keys(activeBidLevels).forEach((priceString) => {
+        const price = Number(priceString);
+        if (previousPrice > price && latestPrice <= price) {
+          addSweep(price, activeBidLevels[priceString], 'SELL_SWEEP');
         }
       });
-
-      sweptLiquidityRef.current = sweptLiquidityRef.current.filter((s) => now - s.timestamp < 15000);
     }
 
+    if (Number.isFinite(latestPrice) && latestPrice > 0) {
+      previousLiquidityPriceRef.current = latestPrice;
+    }
+
+    sweptLiquidityRef.current = recentSweeps;
+    if (sweepsChanged) setSweptLiquidity(recentSweeps);
+
+    if (showSweeps) {
+      recentSweeps.forEach((sweep) => {
+        delete currentActive[sweep.price];
+      });
+    }
     activeLiquidityRef.current = currentActive;
-  }, [minLiquidityUsd]);
+  }, [minLiquidityUsd, showSweeps]);
 
   // Versiunea curentă a funcției, disponibilă pentru WebSocket fără dependențe în efecte
   syncRef.current = syncAndFilterLiquidity;
@@ -489,7 +543,6 @@ export default function DeepLiquidityHeatmapChart() {
   // Resetarea datelor la schimbarea simbolului
   useEffect(() => {
     priceLoadedForSymbolRef.current = null;
-    initialCenterKeyRef.current = null;
     setFixedAnchorPrice(null);
     setCurrentPrice(null);
     setCoinStats({
@@ -518,6 +571,8 @@ export default function DeepLiquidityHeatmapChart() {
     localOrderBookRef.current = { bids: {}, asks: {} };
     activeLiquidityRef.current = {};
     sweptLiquidityRef.current = [];
+    previousLiquidityPriceRef.current = null;
+    setSweptLiquidity([]);
 
     if (domContainerRef.current) {
       domContainerRef.current.scrollTop = 0;
@@ -802,12 +857,12 @@ export default function DeepLiquidityHeatmapChart() {
         const now = Date.now();
         sweptLiquidityRef.current.forEach((sweep) => {
           const elapsed = now - sweep.timestamp;
-          if (elapsed > 15000) return;
+          if (elapsed > LIQUIDITY_SWEEP_DISPLAY_MS) return;
 
           const yCoord = series.priceToCoordinate(sweep.price);
           if (yCoord === null || yCoord < 0 || yCoord > height) return;
 
-          const fadeRatio = 1 - elapsed / 15000;
+          const fadeRatio = 1 - elapsed / LIQUIDITY_SWEEP_DISPLAY_MS;
 
           ctx.save();
           ctx.strokeStyle = sweep.type === 'BUY_SWEEP'
@@ -902,7 +957,7 @@ export default function DeepLiquidityHeatmapChart() {
       currentCandleRef.current?.low
     );
     requestAnimationFrame(drawLiquidityMap);
-  }, [orderBook, currentPrice, showLiquidity, minLiquidityUsd, syncAndFilterLiquidity, drawLiquidityMap]);
+  }, [orderBook, currentPrice, showLiquidity, minLiquidityUsd, sweptLiquidity, syncAndFilterLiquidity, drawLiquidityMap]);
 
   // Inițializarea graficului
   useEffect(() => {
@@ -1368,6 +1423,44 @@ export default function DeepLiquidityHeatmapChart() {
     return levels;
   }, [fixedAnchorPrice, tickStep, precision]);
 
+  const largestLiquidityLevel = useMemo(() => {
+    const basePosition = priceLevels.findIndex((level) => level.index === 2000);
+    const basePrice = priceLevels[basePosition]?.rawPrice;
+    if (basePrice === undefined || tickStep <= 0) return null;
+
+    let largestLevel = null;
+    const inspectSide = (bookSide, isAsk) => {
+      Object.entries(bookSide).forEach(([priceString, quantity]) => {
+        const price = Number(priceString);
+        const value = price * quantity;
+        if (
+          !Number.isFinite(price) ||
+          !Number.isFinite(value) ||
+          value <= 0 ||
+          value < minLiquidityUsd ||
+          sweptLiquidity.some((sweep) => sweep.price === price) ||
+          (largestLevel && value <= largestLevel.value)
+        ) return;
+
+        largestLevel = {
+          price,
+          value,
+          position: getTradeLevelPosition(
+            price,
+            isAsk,
+            basePrice,
+            tickStep,
+            basePosition
+          ),
+        };
+      });
+    };
+
+    inspectSide(orderBook.asks, true);
+    inspectSide(orderBook.bids, false);
+    return largestLevel;
+  }, [orderBook, minLiquidityUsd, priceLevels, sweptLiquidity, tickStep]);
+
   const currentPriceIndex = useMemo(() => {
     if (!currentPrice || priceLevels.length === 0) return -1;
 
@@ -1505,24 +1598,21 @@ export default function DeepLiquidityHeatmapChart() {
 
   useEffect(() => {
     if (
+      !keepDomCentered ||
       currentPriceIndex === -1 ||
       priceLoadedForSymbolRef.current !== symbol.toUpperCase()
     ) return;
 
-    const centerKey = `${symbol}:${activeTab}`;
-    if (initialCenterKeyRef.current !== centerKey) {
-      initialCenterKeyRef.current = centerKey;
-      centerDomRef.current();
-    }
-  }, [symbol, activeTab, currentPriceIndex]);
+    centerDomRef.current();
+  }, [keepDomCentered, symbol, activeTab, currentPriceIndex]);
 
   useEffect(() => {
     const intervalId = setInterval(() => {
-      centerDomRef.current();
+      if (keepDomCentered) centerDomRef.current();
     }, 60 * 1000);
 
     return () => clearInterval(intervalId);
-  }, [symbol, activeTab]);
+  }, [keepDomCentered, symbol, activeTab]);
 
   // Space = centrare DOM
   useEffect(() => {
@@ -1555,6 +1645,28 @@ export default function DeepLiquidityHeatmapChart() {
 
   const visibleTradeStart = Math.max(0, startIndex);
   const visibleTradeEnd = Math.min(priceLevels.length - 1, endIndex);
+  const visibleSweptLiquidity = useMemo(() => {
+    if (!showSweeps) return [];
+
+    const basePosition = priceLevels.findIndex((level) => level.index === 2000);
+    const basePrice = priceLevels[basePosition]?.rawPrice;
+    if (basePrice === undefined || tickStep <= 0) return [];
+
+    return sweptLiquidity
+      .map((sweep) => ({
+        ...sweep,
+        position: getTradeLevelPosition(
+          sweep.price,
+          sweep.type === 'BUY_SWEEP',
+          basePrice,
+          tickStep,
+          basePosition
+        ),
+      }))
+      .filter((sweep) => (
+        sweep.position >= visibleTradeStart && sweep.position <= visibleTradeEnd
+      ));
+  }, [priceLevels, showSweeps, sweptLiquidity, tickStep, visibleTradeEnd, visibleTradeStart]);
   const visibleTradeHeight = Math.max(
     0,
     (visibleTradeEnd - visibleTradeStart + 1) * ROW_HEIGHT
@@ -1857,6 +1969,17 @@ export default function DeepLiquidityHeatmapChart() {
               }`}
             >
               {showSweeps ? '⚡ Sweeps: ON' : '⚡ Sweeps: OFF'}
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setKeepDomCentered((prev) => !prev)}
+              aria-pressed={keepDomCentered}
+              className={`px-2 py-0.5 text-[10px] md:text-xs font-semibold rounded ${
+                keepDomCentered ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-400'
+              }`}
+            >
+              DOM Center: {keepDomCentered ? 'ON' : 'OFF'}
             </button>
 
             <div className="flex items-center gap-1 text-[10px] md:text-xs text-gray-400 pl-1 border-l border-gray-700">
@@ -2216,8 +2339,65 @@ export default function DeepLiquidityHeatmapChart() {
                     viewBox={`0 0 ${tradeFeedWidth} ${visibleTradeHeight}`}
                     preserveAspectRatio="none"
                     role="img"
-                    aria-label="Recent trade markers"
+                    aria-label={largestLiquidityLevel
+                      ? `Recent trade markers. Largest liquidity level: ${formatCompactCurrency(largestLiquidityLevel.value)} at ${largestLiquidityLevel.price}`
+                      : 'Recent trade markers'}
                   >
+                      {showLiquidity &&
+                        largestLiquidityLevel &&
+                        largestLiquidityLevel.position >= visibleTradeStart &&
+                        largestLiquidityLevel.position <= visibleTradeEnd && (
+                          <line
+                            x1="0"
+                            x2={tradeFeedWidth}
+                            y1={(largestLiquidityLevel.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2}
+                            y2={(largestLiquidityLevel.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2}
+                            stroke="#dc2626"
+                            strokeWidth="2"
+                            vectorEffect="non-scaling-stroke"
+                          >
+                            <title>
+                              {`Largest liquidity level: ${formatCompactCurrency(largestLiquidityLevel.value)} at ${largestLiquidityLevel.price}`}
+                            </title>
+                          </line>
+                        )}
+                      {showLiquidity && visibleSweptLiquidity.map((sweep) => {
+                        const y = (sweep.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                        const color = sweep.type === 'BUY_SWEEP' ? '#f59e0b' : '#3b82f6';
+                        const side = sweep.type === 'BUY_SWEEP' ? 'ask' : 'bid';
+
+                        return (
+                          <g key={`swept-${sweep.type}-${sweep.price}-${sweep.timestamp}`}>
+                            <line
+                              x1="0"
+                              x2={tradeFeedWidth}
+                              y1={y}
+                              y2={y}
+                              stroke={color}
+                              strokeWidth="2"
+                              strokeDasharray="5 3"
+                              vectorEffect="non-scaling-stroke"
+                            >
+                              <title>
+                                {`Liquidity taken (${side}): ${formatCompactCurrency(sweep.value)} at ${sweep.price}`}
+                              </title>
+                            </line>
+                            <text
+                              x="3"
+                              y={y - 2}
+                              fill={color}
+                              stroke="#0b0e14"
+                              strokeWidth="2"
+                              paintOrder="stroke"
+                              fontSize="8"
+                              fontWeight="700"
+                              fontFamily="ui-monospace, SFMono-Regular, monospace"
+                            >
+                              TAKEN
+                            </text>
+                          </g>
+                        );
+                      })}
                       {visibleTradePoints.length > 1 && (
                         <polyline
                           ref={tradeFeedLineRef}
