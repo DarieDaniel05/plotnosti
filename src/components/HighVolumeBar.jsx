@@ -13,11 +13,64 @@ const TIMEFRAMES = [
 const ROW_HEIGHT = 20;
 const VISIBLE_BUFFER = 10;
 
+// Binance USDⓈ-M Futures.
+// WebSocket-ul este împărțit pe rute: /public (order book) și /market (kline, ticker, trade).
+// URL-urile vechi (wss://fstream.binance.com/stream) au fost scoase din funcțiune pe 2026-04-23.
+const FUTURES_REST = 'https://fapi.binance.com/fapi/v1';
+const FUTURES_WS_PUBLIC = 'wss://fstream.binance.com/public/stream';
+const FUTURES_WS_MARKET = 'wss://fstream.binance.com/market/stream';
+
 const formatDollarVolume = (valInDollars) => {
   if (!valInDollars || valInDollars <= 0) return '';
   if (valInDollars >= 1000000) return `$${(valInDollars / 1000000).toFixed(1)}M`;
   if (valInDollars >= 1000) return `$${(valInDollars / 1000).toFixed(1)}K`;
   return `$${valInDollars.toFixed(0)}`;
+};
+
+// Conexiune WebSocket cu reconectare automată (pauză 1s → 15s).
+// Returnează o funcție care închide definitiv conexiunea.
+const createReconnectingSocket = (url, { onOpen, onMessage }) => {
+  let socket = null;
+  let timer = null;
+  let attempt = 0;
+  let disposed = false;
+
+  const connect = () => {
+    if (disposed) return;
+
+    const ws = new WebSocket(url);
+    socket = ws;
+
+    ws.onopen = () => {
+      if (disposed || socket !== ws) return;
+      attempt = 0;
+      onOpen?.();
+    };
+
+    ws.onmessage = (event) => {
+      if (disposed || socket !== ws) return;
+      onMessage(event);
+    };
+
+    ws.onerror = () => {
+      ws.close();
+    };
+
+    ws.onclose = () => {
+      if (disposed || socket !== ws) return;
+      const delay = Math.min(15000, 1000 * 2 ** attempt);
+      attempt += 1;
+      timer = setTimeout(connect, delay);
+    };
+  };
+
+  connect();
+
+  return () => {
+    disposed = true;
+    clearTimeout(timer);
+    socket?.close();
+  };
 };
 
 export default function DeepLiquidityHeatmapChart() {
@@ -70,6 +123,11 @@ export default function DeepLiquidityHeatmapChart() {
   const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
   const markersRef = useRef([]); // Stochează markerele de sweep pe grafic
 
+  // Ref-uri citite de WebSocket / fetch, ca să nu re-creăm conexiunile la fiecare tick de preț
+  const currentPriceRef = useRef(null);
+  const syncRef = useRef(null);
+  const drawRef = useRef(null);
+
   // Redimensionare redesenare grafic la schimbarea tab-ului
   useEffect(() => {
     if (activeTab === 'chart' && chartInstanceRef.current && chartContainerRef.current) {
@@ -88,7 +146,7 @@ export default function DeepLiquidityHeatmapChart() {
     if (!candlestickSeriesRef.current || !showSweeps) return;
 
     const isBuySweep = type === 'BUY_SWEEP'; // Prețul a urcat și a măturat ASKS (Lichiditate Buy-side)
-    
+
     const newMarker = {
       time: time,
       position: isBuySweep ? 'aboveBar' : 'belowBar',
@@ -165,6 +223,9 @@ export default function DeepLiquidityHeatmapChart() {
     activeLiquidityRef.current = currentActive;
   }, [minLiquidityUsd, addSweepMarker]);
 
+  // Versiunea curentă a funcției, disponibilă pentru WebSocket fără dependențe în efecte
+  syncRef.current = syncAndFilterLiquidity;
+
   // Măsurarea containerului DOM
   useEffect(() => {
     if (!domContainerRef.current) return;
@@ -197,6 +258,7 @@ export default function DeepLiquidityHeatmapChart() {
     setHoveredPrice(null);
     setScrollTop(0);
 
+    currentPriceRef.current = null;
     currentCandleRef.current = null;
     localOrderBookRef.current = { bids: {}, asks: {} };
     activeLiquidityRef.current = {};
@@ -249,9 +311,9 @@ export default function DeepLiquidityHeatmapChart() {
     return 5;
   }, [tickStep]);
 
-  // Încărcarea simbolurilor Binance
+  // Încărcarea simbolurilor Binance Futures (doar perpetual USDT)
   useEffect(() => {
-    fetch('https://api.binance.com/api/v3/exchangeInfo')
+    fetch(`${FUTURES_REST}/exchangeInfo`)
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
@@ -259,7 +321,12 @@ export default function DeepLiquidityHeatmapChart() {
       .then((data) => {
         if (data.symbols) {
           const usdtPairs = data.symbols
-            .filter((s) => s.status === 'TRADING' && s.quoteAsset === 'USDT')
+            .filter(
+              (s) =>
+                s.status === 'TRADING' &&
+                s.quoteAsset === 'USDT' &&
+                s.contractType === 'PERPETUAL'
+            )
             .map((s) => s.symbol);
 
           setSymbolsList(usdtPairs);
@@ -268,59 +335,152 @@ export default function DeepLiquidityHeatmapChart() {
       .catch((err) => console.error('Eroare la încărcarea simbolurilor:', err));
   }, []);
 
-  // Snapshot Order Book
+  // Order Book Futures: snapshot REST + stream diferențial pe /public.
+  // Evenimentele primite cât timp se încarcă snapshot-ul sunt păstrate și aplicate după el,
+  // iar cele mai vechi decât snapshot-ul sunt ignorate (procedura oficială Binance).
   useEffect(() => {
-    let cancelled = false;
     const sym = symbol.toUpperCase();
+    const streamSym = symbol.toLowerCase();
 
-    fetch(`https://api.binance.com/api/v3/depth?symbol=${sym}&limit=1000`)
-      .then((res) => {
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      })
-      .then((data) => {
-        if (cancelled) return;
+    let disposed = false;
+    let ready = false; // true după ce snapshot-ul a fost aplicat
+    let lastUpdateId = 0;
+    let buffer = [];
+    let syncToken = 0; // invalidează cererile de snapshot mai vechi
+    let failures = 0;
+    let retryTimer = null;
 
-        if (data.code) {
-          throw new Error(data.msg || 'Binance API error');
-        }
+    const applyDiff = (data) => {
+      const ob = localOrderBookRef.current;
 
-        const bidsObj = {};
-        const asksObj = {};
+      (data.b || []).forEach(([pStr, qStr]) => {
+        const p = parseFloat(pStr);
+        const q = parseFloat(qStr);
 
-        if (data.bids) {
-          data.bids.forEach(([p, q]) => {
-            bidsObj[parseFloat(p)] = parseFloat(q);
-          });
-        }
-
-        if (data.asks) {
-          data.asks.forEach(([p, q]) => {
-            asksObj[parseFloat(p)] = parseFloat(q);
-          });
-        }
-
-        localOrderBookRef.current = { bids: bidsObj, asks: asksObj };
-        setOrderBook({ bids: bidsObj, asks: asksObj });
-
-        syncAndFilterLiquidity(
-          currentPrice,
-          currentCandleRef.current?.high,
-          currentCandleRef.current?.low
-        );
-
-        requestAnimationFrame(drawLiquidityMap);
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          console.error('Eroare la încărcarea Order Book:', err);
+        if (q === 0) {
+          delete ob.bids[p];
+        } else {
+          ob.bids[p] = q;
         }
       });
 
-    return () => {
-      cancelled = true;
+      (data.a || []).forEach(([pStr, qStr]) => {
+        const p = parseFloat(pStr);
+        const q = parseFloat(qStr);
+
+        if (q === 0) {
+          delete ob.asks[p];
+        } else {
+          ob.asks[p] = q;
+        }
+      });
     };
-  }, [symbol, syncAndFilterLiquidity, currentPrice]);
+
+    const publishBook = () => {
+      const ob = localOrderBookRef.current;
+      setOrderBook({ bids: { ...ob.bids }, asks: { ...ob.asks } });
+
+      syncRef.current?.(
+        currentPriceRef.current,
+        currentCandleRef.current?.high,
+        currentCandleRef.current?.low
+      );
+    };
+
+    const resync = () => {
+      if (disposed) return;
+
+      clearTimeout(retryTimer);
+      ready = false;
+      buffer = [];
+      const token = ++syncToken;
+
+      fetch(`${FUTURES_REST}/depth?symbol=${sym}&limit=1000`)
+        .then((res) => {
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          return res.json();
+        })
+        .then((data) => {
+          if (disposed || token !== syncToken) return;
+
+          if (data.code) {
+            throw new Error(data.msg || 'Binance API error');
+          }
+
+          const bidsObj = {};
+          const asksObj = {};
+
+          (data.bids || []).forEach(([p, q]) => {
+            bidsObj[parseFloat(p)] = parseFloat(q);
+          });
+
+          (data.asks || []).forEach(([p, q]) => {
+            asksObj[parseFloat(p)] = parseFloat(q);
+          });
+
+          localOrderBookRef.current = { bids: bidsObj, asks: asksObj };
+          lastUpdateId = data.lastUpdateId || 0;
+
+          buffer.forEach((evt) => {
+            if (evt.u >= lastUpdateId) applyDiff(evt);
+          });
+
+          buffer = [];
+          ready = true;
+          failures = 0;
+
+          publishBook();
+          requestAnimationFrame(() => drawRef.current?.());
+        })
+        .catch((err) => {
+          if (disposed || token !== syncToken) return;
+
+          console.error('Eroare la încărcarea Order Book:', err);
+
+          // Reîncercare cu pauză tot mai mare (3s → 60s), ca să nu depășim limitele Binance
+          failures += 1;
+          retryTimer = setTimeout(resync, Math.min(60000, 3000 * 2 ** (failures - 1)));
+        });
+    };
+
+    const stopSocket = createReconnectingSocket(
+      `${FUTURES_WS_PUBLIC}?streams=${streamSym}@depth@100ms`,
+      {
+        onOpen: resync,
+        onMessage: (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            const data = message.data || message;
+
+            if (data.e !== 'depthUpdate') return;
+
+            if (!ready) {
+              buffer.push(data);
+              if (buffer.length > 5000) buffer.shift();
+              return;
+            }
+
+            if (data.u < lastUpdateId) return;
+
+            applyDiff(data);
+            publishBook();
+          } catch (err) {
+            console.error('Eroare la procesarea datelor Order Book:', err);
+          }
+        },
+      }
+    );
+
+    // Resincronizare periodică (reîmprospătează și nivelele din afara ferestrei de 1000 de nivele)
+    const periodicResync = setInterval(resync, 5 * 60 * 1000);
+
+    return () => {
+      disposed = true;
+      clearInterval(periodicResync);
+      clearTimeout(retryTimer);
+      stopSocket();
+    };
+  }, [symbol]);
 
   // Desenarea hărții de lichiditate și a SWEEPS-urilor pe Canvas
   const drawLiquidityMap = useCallback(() => {
@@ -392,15 +552,15 @@ export default function DeepLiquidityHeatmapChart() {
 
         // Animație de fading out
         const fadeRatio = 1 - elapsed / 15000;
-        
+
         // Linie punctată vibrantă pe nivelul măturat
         ctx.save();
-        ctx.strokeStyle = sweep.type === 'BUY_SWEEP' 
-          ? `rgba(245, 158, 11, ${fadeRatio})` 
+        ctx.strokeStyle = sweep.type === 'BUY_SWEEP'
+          ? `rgba(245, 158, 11, ${fadeRatio})`
           : `rgba(59, 130, 246, ${fadeRatio})`;
         ctx.lineWidth = 2;
         ctx.setLineDash([6, 4]);
-        
+
         ctx.beginPath();
         ctx.moveTo(0, yCoord);
         ctx.lineTo(width, yCoord);
@@ -408,18 +568,21 @@ export default function DeepLiquidityHeatmapChart() {
         ctx.restore();
 
         // Etichetă "SWEEP"
-        ctx.fillStyle = sweep.type === 'BUY_SWEEP' 
-          ? `rgba(245, 158, 11, ${fadeRatio * 0.9})` 
+        ctx.fillStyle = sweep.type === 'BUY_SWEEP'
+          ? `rgba(245, 158, 11, ${fadeRatio * 0.9})`
           : `rgba(59, 130, 246, ${fadeRatio * 0.9})`;
         ctx.font = 'bold 10px sans-serif';
         ctx.fillText(
-          `⚡ SWEEP: ${formatDollarVolume(sweep.volume)}`, 
-          width - 130, 
+          `⚡ SWEEP: ${formatDollarVolume(sweep.volume)}`,
+          width - 130,
           yCoord - 3
         );
       });
     }
   }, [showLiquidity, showSweeps, minLiquidityUsd]);
+
+  // Versiunea curentă a funcției de desenare, disponibilă pentru callback-urile asincrone
+  drawRef.current = drawLiquidityMap;
 
   useEffect(() => {
     syncAndFilterLiquidity(
@@ -518,13 +681,13 @@ export default function DeepLiquidityHeatmapChart() {
     };
   }, [drawLiquidityMap]);
 
-  // Încărcarea lumânărilor
+  // Încărcarea lumânărilor (Futures)
   useEffect(() => {
     let cancelled = false;
     const requestedSymbol = symbol.toUpperCase();
 
     fetch(
-      `https://api.binance.com/api/v3/klines?symbol=${requestedSymbol}&interval=${timeframe}&limit=300`
+      `${FUTURES_REST}/klines?symbol=${requestedSymbol}&interval=${timeframe}&limit=300`
     )
       .then((res) => {
         if (!res.ok) throw new Error(`Binance Klines HTTP ${res.status}`);
@@ -564,6 +727,7 @@ export default function DeepLiquidityHeatmapChart() {
           const lastCandle = formattedCandles[formattedCandles.length - 1];
 
           currentCandleRef.current = { ...lastCandle };
+          currentPriceRef.current = lastCandle.close;
           setCurrentPrice(lastCandle.close);
           setFixedAnchorPrice(lastCandle.close);
         }
@@ -586,139 +750,95 @@ export default function DeepLiquidityHeatmapChart() {
     };
   }, [symbol, timeframe, drawLiquidityMap]);
 
-  // Actualizări WebSocket
+  // Actualizări WebSocket Futures pe /market: kline, ticker, aggTrade.
+  // Prețul curent și funcția de sync sunt citite din ref-uri, deci conexiunea
+  // se reface DOAR la schimbarea simbolului sau a timeframe-ului.
   useEffect(() => {
     const sym = symbol.toLowerCase();
 
-    const ws = new WebSocket(
-      `wss://stream.binance.com:9443/stream?streams=${sym}@kline_${timeframe}/${sym}@depth@100ms/${sym}@ticker/${sym}@trade`
+    const stopSocket = createReconnectingSocket(
+      `${FUTURES_WS_MARKET}?streams=${sym}@kline_${timeframe}/${sym}@ticker/${sym}@aggTrade`,
+      {
+        onMessage: (event) => {
+          try {
+            const message = JSON.parse(event.data);
+            const data = message.data || message;
+
+            if (data.e === 'aggTrade') {
+              const price = parseFloat(data.p);
+              const qty = parseFloat(data.q);
+              const dollarVal = price * qty;
+              const isBuyerMaker = data.m;
+
+              const newTrade = {
+                id: data.a, // la aggTrade id-ul este "a", nu "t"
+                price,
+                dollarVal,
+                isBuy: !isBuyerMaker,
+                time: new Date(data.T).toLocaleTimeString(),
+              };
+
+              setTrades((prev) => [newTrade, ...prev.slice(0, 49)]);
+            }
+
+            if (data.e === '24hrTicker') {
+              const price = parseFloat(data.c);
+
+              currentPriceRef.current = price;
+              setCurrentPrice(price);
+
+              if (candlestickSeriesRef.current && currentCandleRef.current) {
+                const updatedCandle = {
+                  ...currentCandleRef.current,
+                  close: price,
+                  high: Math.max(currentCandleRef.current.high, price),
+                  low: Math.min(currentCandleRef.current.low, price),
+                };
+
+                currentCandleRef.current = updatedCandle;
+                candlestickSeriesRef.current.update(updatedCandle);
+
+                syncRef.current?.(price, updatedCandle.high, updatedCandle.low);
+              }
+            }
+
+            if (data.e === 'kline') {
+              const k = data.k;
+
+              const candle = {
+                time: k.t / 1000,
+                open: parseFloat(k.o),
+                high: parseFloat(k.h),
+                low: parseFloat(k.l),
+                close: parseFloat(k.c),
+              };
+
+              currentCandleRef.current = candle;
+              candlestickSeriesRef.current?.update(candle);
+
+              volumeSeriesRef.current?.update({
+                time: k.t / 1000,
+                value: parseFloat(k.v),
+                color:
+                  parseFloat(k.o) <= parseFloat(k.c)
+                    ? 'rgba(34, 197, 94, 0.3)'
+                    : 'rgba(239, 68, 68, 0.3)',
+              });
+
+              currentPriceRef.current = candle.close;
+              setCurrentPrice(candle.close);
+
+              syncRef.current?.(candle.close, candle.high, candle.low);
+            }
+          } catch (err) {
+            console.error('Eroare la procesarea datelor WebSocket:', err);
+          }
+        },
+      }
     );
 
-    ws.onmessage = (event) => {
-      try {
-        const message = JSON.parse(event.data);
-        const data = message.data || message;
-
-        if (data.e === 'trade') {
-          const price = parseFloat(data.p);
-          const qty = parseFloat(data.q);
-          const dollarVal = price * qty;
-          const isBuyerMaker = data.m;
-
-          const newTrade = {
-            id: data.t,
-            price,
-            dollarVal,
-            isBuy: !isBuyerMaker,
-            time: new Date(data.T).toLocaleTimeString(),
-          };
-
-          setTrades((prev) => [newTrade, ...prev.slice(0, 49)]);
-        }
-
-        if (data.e === '24hrTicker') {
-          const price = parseFloat(data.c);
-
-          setCurrentPrice(price);
-
-          if (candlestickSeriesRef.current && currentCandleRef.current) {
-            const updatedCandle = {
-              ...currentCandleRef.current,
-              close: price,
-              high: Math.max(currentCandleRef.current.high, price),
-              low: Math.min(currentCandleRef.current.low, price),
-            };
-
-            currentCandleRef.current = updatedCandle;
-            candlestickSeriesRef.current.update(updatedCandle);
-
-            syncAndFilterLiquidity(
-              price,
-              updatedCandle.high,
-              updatedCandle.low
-            );
-          }
-        }
-
-        if (data.e === 'kline') {
-          const k = data.k;
-
-          const candle = {
-            time: k.t / 1000,
-            open: parseFloat(k.o),
-            high: parseFloat(k.h),
-            low: parseFloat(k.l),
-            close: parseFloat(k.c),
-          };
-
-          currentCandleRef.current = candle;
-          candlestickSeriesRef.current?.update(candle);
-
-          volumeSeriesRef.current?.update({
-            time: k.t / 1000,
-            value: parseFloat(k.v),
-            color:
-              parseFloat(k.o) <= parseFloat(k.c)
-                ? 'rgba(34, 197, 94, 0.3)'
-                : 'rgba(239, 68, 68, 0.3)',
-          });
-
-          setCurrentPrice(candle.close);
-
-          syncAndFilterLiquidity(
-            candle.close,
-            candle.high,
-            candle.low
-          );
-        }
-
-        if (data.e === 'depthUpdate') {
-          const ob = localOrderBookRef.current;
-
-          if (data.b) {
-            data.b.forEach(([pStr, qStr]) => {
-              const p = parseFloat(pStr);
-              const q = parseFloat(qStr);
-
-              if (q === 0) {
-                delete ob.bids[p];
-              } else {
-                ob.bids[p] = q;
-              }
-            });
-          }
-
-          if (data.a) {
-            data.a.forEach(([pStr, qStr]) => {
-              const p = parseFloat(pStr);
-              const q = parseFloat(qStr);
-
-              if (q === 0) {
-                delete ob.asks[p];
-              } else {
-                ob.asks[p] = q;
-              }
-            });
-          }
-
-          localOrderBookRef.current = ob;
-          setOrderBook({ bids: { ...ob.bids }, asks: { ...ob.asks } });
-
-          syncAndFilterLiquidity(
-            currentPrice,
-            currentCandleRef.current?.high,
-            currentCandleRef.current?.low
-          );
-        }
-      } catch (err) {
-        console.error('Eroare la procesarea datelor WebSocket:', err);
-      }
-    };
-
-    return () => {
-      ws.close();
-    };
-  }, [symbol, timeframe, currentPrice, syncAndFilterLiquidity]);
+    return stopSocket;
+  }, [symbol, timeframe]);
 
   const { bestAsk, bestBid } = useMemo(() => {
     const askPrices = Object.keys(orderBook.asks).map(Number);
