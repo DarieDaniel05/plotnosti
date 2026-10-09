@@ -21,6 +21,7 @@ const TIMEFRAME_SECONDS = {
 
 const ROW_HEIGHT = 20;
 const VISIBLE_BUFFER = 10;
+const TRADE_FEED_DISPLAY_COUNT = 8;
 const DOM_COLUMN_MIN_WIDTHS = [48, 48, 80, 96];
 const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
 const LARGE_TRADE_THRESHOLD_USD = 1000;
@@ -176,9 +177,11 @@ export default function DeepLiquidityHeatmapChart() {
   const [containerHeight, setContainerHeight] = useState(600);
   const [domPanelWidth, setDomPanelWidth] = useState(520);
   const [domColumnWidths, setDomColumnWidths] = useState([0, 1, 0.3, 0.4]);
+  const [tradeFeedWidth, setTradeFeedWidth] = useState(1);
 
   const domResizeRef = useRef(null);
   const domColumnHeaderRef = useRef(null);
+  const tradeFeedColumnRef = useRef(null);
 
   useEffect(() => {
     localStorage.setItem('hv_min_liquidity_usd', minLiquidityUsd.toString());
@@ -224,10 +227,24 @@ export default function DeepLiquidityHeatmapChart() {
   const currentCandleRef = useRef(null);
   const domContainerRef = useRef(null);
   const searchInputRef = useRef(null);
+  const pendingTradesRef = useRef([]);
+  const pendingClusterUpdatesRef = useRef(new Map());
 
   const localOrderBookRef = useRef({ bids: {}, asks: {} });
   const activeLiquidityRef = useRef({});
   const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
+
+  useEffect(() => {
+    const feedColumn = tradeFeedColumnRef.current;
+    if (!feedColumn) return undefined;
+
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      setTradeFeedWidth(Math.max(1, entry.contentRect.width));
+    });
+    resizeObserver.observe(feedColumn);
+
+    return () => resizeObserver.disconnect();
+  }, []);
 
   useEffect(() => {
     let disposed = false;
@@ -459,6 +476,8 @@ export default function DeepLiquidityHeatmapChart() {
     });
     setOrderBook({ bids: {}, asks: {} });
     setTrades([]);
+    pendingTradesRef.current = [];
+    pendingClusterUpdatesRef.current.clear();
     setClusterData({
       windowStart: getClusterWindowStart(Date.now()),
       levels: new Map(),
@@ -549,6 +568,7 @@ export default function DeepLiquidityHeatmapChart() {
 
     let disposed = false;
     let ready = false; // true după ce snapshot-ul a fost aplicat
+    let bookDirty = false;
     let lastUpdateId = 0;
     let buffer = [];
     let syncToken = 0; // invalidează cererile de snapshot mai vechi
@@ -579,9 +599,13 @@ export default function DeepLiquidityHeatmapChart() {
           ob.asks[p] = q;
         }
       });
+
+      bookDirty = true;
     };
 
     const publishBook = () => {
+      if (!bookDirty) return;
+      bookDirty = false;
       const ob = localOrderBookRef.current;
       setOrderBook({ bids: { ...ob.bids }, asks: { ...ob.asks } });
 
@@ -591,6 +615,10 @@ export default function DeepLiquidityHeatmapChart() {
         currentCandleRef.current?.low
       );
     };
+
+    const bookPublishInterval = setInterval(() => {
+      if (ready) publishBook();
+    }, 250);
 
     const resync = () => {
       if (disposed) return;
@@ -634,6 +662,7 @@ export default function DeepLiquidityHeatmapChart() {
           ready = true;
           failures = 0;
 
+          bookDirty = true;
           publishBook();
           requestAnimationFrame(() => drawRef.current?.());
         })
@@ -668,7 +697,6 @@ export default function DeepLiquidityHeatmapChart() {
             if (data.u < lastUpdateId) return;
 
             applyDiff(data);
-            publishBook();
           } catch (err) {
             console.error('Eroare la procesarea datelor Order Book:', err);
           }
@@ -682,6 +710,7 @@ export default function DeepLiquidityHeatmapChart() {
     return () => {
       disposed = true;
       clearInterval(periodicResync);
+      clearInterval(bookPublishInterval);
       clearTimeout(retryTimer);
       stopSocket();
     };
@@ -1079,6 +1108,46 @@ export default function DeepLiquidityHeatmapChart() {
   useEffect(() => {
     const sym = symbol.toLowerCase();
 
+    const flushPendingClusters = () => {
+      const pendingClusterUpdates = pendingClusterUpdatesRef.current;
+      pendingClusterUpdatesRef.current = new Map();
+
+      if (pendingClusterUpdates.size > 0) {
+        const windowStart = getClusterWindowStart(Date.now());
+        setClusterData((current) => {
+          const levels = current.windowStart === windowStart
+            ? new Map(current.levels)
+            : new Map();
+
+          pendingClusterUpdates.forEach((update, price) => {
+            const level = { ...(levels.get(price) || { buyVolume: 0, sellVolume: 0 }) };
+            level.buyVolume += update.buyVolume;
+            level.sellVolume += update.sellVolume;
+            levels.set(price, level);
+          });
+
+          return { windowStart, levels };
+        });
+      }
+    };
+
+    let tradeFlushFrame = null;
+    const scheduleTradeFlush = () => {
+      if (tradeFlushFrame !== null) return;
+
+      tradeFlushFrame = requestAnimationFrame(() => {
+        tradeFlushFrame = null;
+        const pendingTrades = pendingTradesRef.current.splice(0);
+        if (pendingTrades.length === 0) return;
+
+        setTrades((current) => [
+          ...pendingTrades.reverse(),
+          ...current,
+        ].slice(0, 50));
+      });
+    };
+
+    const clusterFlushInterval = setInterval(flushPendingClusters, 100);
     const stopSocket = createReconnectingSocket(
       `${FUTURES_WS_MARKET}?streams=${sym}@kline_${timeframe}/${sym}@ticker/${sym}@aggTrade`,
       {
@@ -1102,26 +1171,19 @@ export default function DeepLiquidityHeatmapChart() {
                 time: new Date(data.T).toLocaleTimeString(),
               };
 
-              setTrades((prev) => [newTrade, ...prev.slice(0, 49)]);
-
-              const windowStart = getClusterWindowStart(Date.now());
-              setClusterData((current) => {
-                if (windowStart < current.windowStart) return current;
-
-                const levels = windowStart === current.windowStart
-                  ? new Map(current.levels)
-                  : new Map();
-                const level = { ...(levels.get(price) || { buyVolume: 0, sellVolume: 0 }) };
-
-                if (newTrade.isBuy) {
-                  level.buyVolume += dollarVal;
-                } else {
-                  level.sellVolume += dollarVal;
-                }
-                levels.set(price, level);
-
-                return { windowStart, levels };
-              });
+              pendingTradesRef.current.push(newTrade);
+              if (pendingTradesRef.current.length > 50) {
+                pendingTradesRef.current.shift();
+              }
+              scheduleTradeFlush();
+              const pendingLevel = pendingClusterUpdatesRef.current.get(price)
+                || { buyVolume: 0, sellVolume: 0 };
+              if (newTrade.isBuy) {
+                pendingLevel.buyVolume += dollarVal;
+              } else {
+                pendingLevel.sellVolume += dollarVal;
+              }
+              pendingClusterUpdatesRef.current.set(price, pendingLevel);
             }
 
             if (data.e === '24hrTicker') {
@@ -1190,7 +1252,15 @@ export default function DeepLiquidityHeatmapChart() {
       }
     );
 
-    return stopSocket;
+    return () => {
+      clearInterval(clusterFlushInterval);
+      if (tradeFlushFrame !== null) {
+        cancelAnimationFrame(tradeFlushFrame);
+      }
+      pendingTradesRef.current = [];
+      pendingClusterUpdatesRef.current.clear();
+      stopSocket();
+    };
   }, [symbol, timeframe]);
 
   const { bestAsk, bestBid } = useMemo(() => {
@@ -1280,6 +1350,18 @@ export default function DeepLiquidityHeatmapChart() {
     );
   }, [currentPrice, priceLevels, tickStep]);
 
+  const largeTradeThresholdUsd = useMemo(() => {
+    const recentTradeValues = trades
+      .map((trade) => trade.dollarVal)
+      .filter((value) => Number.isFinite(value) && value > 0)
+      .sort((a, b) => a - b);
+
+    if (recentTradeValues.length < 10) return LARGE_TRADE_THRESHOLD_USD;
+
+    const percentileIndex = Math.ceil(recentTradeValues.length * 0.9) - 1;
+    return recentTradeValues[percentileIndex];
+  }, [trades]);
+
   const tradesByLevel = useMemo(() => {
     const levels = new Map();
     const basePosition = priceLevels.findIndex((level) => level.index === 2000);
@@ -1302,7 +1384,7 @@ export default function DeepLiquidityHeatmapChart() {
           const key = priceLevels[position].index;
           let level = levels.get(key);
           if (!level) {
-            level = { buyVolume: 0, sellVolume: 0, trades: [] };
+            level = { buyVolume: 0, sellVolume: 0 };
             levels.set(key, level);
           }
 
@@ -1311,57 +1393,81 @@ export default function DeepLiquidityHeatmapChart() {
       });
     }
 
-    trades.forEach((trade) => {
-      const position = getTradeLevelPosition(
-        trade.price,
-        trade.isBuy,
-        basePrice,
-        tickStep,
-        basePosition
-      );
-      if (position < 0 || position >= priceLevels.length) return;
-
-      const key = priceLevels[position].index;
-      let level = levels.get(key);
-      if (!level) {
-        level = { buyVolume: 0, sellVolume: 0, trades: [] };
-        levels.set(key, level);
-      }
-      level.trades.push(trade);
-    });
-
     return levels;
-  }, [trades, clusterData, priceLevels, tickStep]);
+  }, [clusterData, priceLevels, tickStep]);
 
-  const largeOrderBands = useMemo(() => {
-    if (currentPriceIndex < 0) return [];
+  const bookVolumeByLevel = useMemo(() => {
+    const levels = new Map();
+    const basePosition = priceLevels.findIndex((level) => level.index === 2000);
+    const basePrice = priceLevels[basePosition]?.rawPrice;
+    if (basePrice === undefined || tickStep <= 0) return levels;
 
+    const addBookSide = (bookSide, isAsk) => {
+      Object.entries(bookSide).forEach(([priceString, quantity]) => {
+        const price = Number(priceString);
+        const position = getTradeLevelPosition(
+          price,
+          isAsk,
+          basePrice,
+          tickStep,
+          basePosition
+        );
+        const level = priceLevels[position];
+        if (!level) return;
+
+        const volume = levels.get(level.index) || { ask: 0, bid: 0 };
+        volume[isAsk ? 'ask' : 'bid'] += price * quantity;
+        levels.set(level.index, volume);
+      });
+    };
+
+    addBookSide(orderBook.asks, true);
+    addBookSide(orderBook.bids, false);
+    return levels;
+  }, [orderBook, priceLevels, tickStep]);
+
+  const tradeFeedPoints = useMemo(() => {
     const basePosition = priceLevels.findIndex((level) => level.index === 2000);
     const basePrice = priceLevels[basePosition]?.rawPrice;
     if (basePrice === undefined || tickStep <= 0) return [];
 
     return trades
-      .filter((trade) => trade.dollarVal >= LARGE_TRADE_THRESHOLD_USD)
-      .map((trade) => {
-        const tradePosition = getTradeLevelPosition(
+      .slice(0, TRADE_FEED_DISPLAY_COUNT)
+      .reverse()
+      .map((trade) => ({
+        ...trade,
+        position: getTradeLevelPosition(
           trade.price,
           trade.isBuy,
           basePrice,
           tickStep,
           basePosition
-        );
-        if (tradePosition < 0 || tradePosition >= priceLevels.length) return null;
+        ),
+      }))
+      .filter((trade) => trade.position >= 0 && trade.position < priceLevels.length);
+  }, [trades, priceLevels, tickStep]);
 
+  const getTradeFeedX = (index) => (
+    tradeFeedPoints.length === 1
+      ? tradeFeedWidth / 2
+      : 10 + (index / (tradeFeedPoints.length - 1)) * Math.max(0, tradeFeedWidth - 20)
+  );
+
+  const largeOrderBands = useMemo(() => {
+    if (currentPriceIndex < 0) return [];
+
+    return tradeFeedPoints
+      .filter((trade) => trade.dollarVal >= largeTradeThresholdUsd)
+      .map((trade) => {
         return {
           id: trade.id,
           isBuy: trade.isBuy,
-          start: Math.min(currentPriceIndex, tradePosition),
-          end: Math.max(currentPriceIndex, tradePosition),
+          start: Math.min(currentPriceIndex, trade.position),
+          end: Math.max(currentPriceIndex, trade.position),
         };
       })
-      .filter(Boolean)
-      .slice(0, 10);
-  }, [trades, currentPriceIndex, priceLevels, tickStep]);
+      .slice(-10);
+  }, [tradeFeedPoints, currentPriceIndex, largeTradeThresholdUsd]);
 
   const centerDom = useCallback(() => {
     requestAnimationFrame(() => {
@@ -1433,6 +1539,25 @@ export default function DeepLiquidityHeatmapChart() {
       VISIBLE_BUFFER
   );
 
+  const visibleTradeStart = Math.max(0, startIndex);
+  const visibleTradeEnd = Math.min(priceLevels.length - 1, endIndex);
+  const visibleTradeHeight = Math.max(
+    0,
+    (visibleTradeEnd - visibleTradeStart + 1) * ROW_HEIGHT
+  );
+  const visibleTradePoints = tradeFeedPoints
+    .map((trade, index) => ({ ...trade, feedIndex: index }))
+    .filter((trade) => (
+      trade.position >= visibleTradeStart && trade.position <= visibleTradeEnd
+    ));
+  const visibleLargeOrderBands = largeOrderBands
+    .filter((band) => band.end >= visibleTradeStart && band.start <= visibleTradeEnd)
+    .map((band) => ({
+      ...band,
+      start: Math.max(band.start, visibleTradeStart),
+      end: Math.min(band.end, visibleTradeEnd),
+    }));
+
   const visibleRows = useMemo(() => {
     const rows = [];
 
@@ -1440,32 +1565,16 @@ export default function DeepLiquidityHeatmapChart() {
       const level = priceLevels[i];
       if (!level) continue;
 
-      const price = level.rawPrice;
-      let askDollarVolume = 0;
-      let bidDollarVolume = 0;
-
-      Object.entries(orderBook.asks).forEach(([pStr, vol]) => {
-        const p = parseFloat(pStr);
-        if (p >= price && p < price + tickStep) {
-          askDollarVolume += p * vol;
-        }
-      });
-
-      Object.entries(orderBook.bids).forEach(([pStr, vol]) => {
-        const p = parseFloat(pStr);
-        if (p <= price && p > price - tickStep) {
-          bidDollarVolume += p * vol;
-        }
-      });
+      const levelVolume = bookVolumeByLevel.get(level.index);
 
       rows.push({
         ...level,
         topOffset: i * ROW_HEIGHT,
-        askDollarVolume,
-        bidDollarVolume,
+        askDollarVolume: levelVolume?.ask ?? 0,
+        bidDollarVolume: levelVolume?.bid ?? 0,
         isCurrentLevel: i === currentPriceIndex,
-        isBestAsk: bestAsk && Math.abs(price - bestAsk) < tickStep / 2,
-        isBestBid: bestBid && Math.abs(price - bestBid) < tickStep / 2,
+        isBestAsk: bestAsk && Math.abs(level.rawPrice - bestAsk) < tickStep / 2,
+        isBestBid: bestBid && Math.abs(level.rawPrice - bestBid) < tickStep / 2,
       });
     }
 
@@ -1474,8 +1583,7 @@ export default function DeepLiquidityHeatmapChart() {
     priceLevels,
     startIndex,
     endIndex,
-    orderBook,
-    tickStep,
+    bookVolumeByLevel,
     currentPriceIndex,
     bestAsk,
     bestBid,
@@ -1822,6 +1930,16 @@ export default function DeepLiquidityHeatmapChart() {
                     <span>{title}</span>
                     <span className="text-[8px] font-medium text-blue-300">{clusterWindowEnd}</span>
                   </span>
+                ) : index === 1 ? (
+                  <span
+                    className="flex min-w-0 items-center gap-1"
+                    title="Big-trade cutoff is estimated from the 90th percentile of recent aggregate trades for this symbol."
+                  >
+                    <span>{title}</span>
+                    <span className="text-[8px] font-medium text-amber-300">
+                      BIG ≥ {formatDollarVolume(largeTradeThresholdUsd)}
+                    </span>
+                  </span>
                 ) : title}
                 {index < 3 && (
                   <span
@@ -1918,30 +2036,7 @@ export default function DeepLiquidityHeatmapChart() {
                       })()}
                     </div>
 
-                    <div className="relative h-full min-w-0">
-                      <div
-                        className="relative z-30 flex h-full min-w-0 flex-row-reverse flex-nowrap items-center justify-start gap-0.5 overflow-hidden whitespace-nowrap"
-                        aria-label="Recent trades at this price level"
-                      >
-                        {(tradesByLevel.get(row.index)?.trades ?? []).map((trade) => (
-                          <span
-                            key={trade.id}
-                            className={`flex h-5 shrink-0 items-center justify-center border text-[9px] font-extrabold leading-none text-white ${
-                              trade.dollarVal >= LARGE_TRADE_THRESHOLD_USD
-                                ? 'min-w-max rounded-none px-1.5'
-                                : 'min-w-4 rounded-full px-1 text-[7px]'
-                            } ${
-                              trade.isBuy
-                                ? 'border-green-300/70 bg-green-600'
-                                : 'border-red-300/70 bg-red-600'
-                            }`}
-                            title={`${trade.isBuy ? 'Buy' : 'Sell'} ${formatDollarVolume(trade.dollarVal)} @ ${trade.price} (${trade.time})`}
-                          >
-                            {trade.dollarVal >= LARGE_TRADE_THRESHOLD_USD ? formatDollarVolume(trade.dollarVal) : ''}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
+                    <div className="relative h-full min-w-0" aria-label="Trade price path" />
 
                     <div className="relative h-full flex items-center justify-start overflow-hidden">
                       <div
@@ -1978,7 +2073,134 @@ export default function DeepLiquidityHeatmapChart() {
                   </div>
                 );
               })}
-              {largeOrderBands.map((band) => (
+              <div
+                className="pointer-events-none absolute left-0 right-0 top-0 z-30 grid"
+                style={{
+                  top: `${visibleTradeStart * ROW_HEIGHT}px`,
+                  height: `${visibleTradeHeight}px`,
+                  gridTemplateColumns: domGridTemplateColumns,
+                }}
+                aria-label="Recent trades by price and time"
+              >
+                <div
+                  ref={tradeFeedColumnRef}
+                  style={{ gridColumn: 2, height: `${visibleTradeHeight}px` }}
+                >
+                  <svg
+                    className="h-full w-full"
+                    viewBox={`0 0 ${tradeFeedWidth} ${visibleTradeHeight}`}
+                    preserveAspectRatio="none"
+                    role="img"
+                    aria-label="Recent trade markers"
+                  >
+                      {visibleTradePoints.length > 1 && (
+                        <polyline
+                          points={visibleTradePoints
+                            .map((trade) => {
+                              const x = getTradeFeedX(trade.feedIndex);
+                              const y = (trade.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                              return `${x},${y}`;
+                            })
+                            .join(' ')}
+                          fill="none"
+                          stroke="#cbd5e1"
+                          strokeOpacity="0.75"
+                          strokeWidth="1.5"
+                          vectorEffect="non-scaling-stroke"
+                        />
+                      )}
+                      {visibleTradePoints.map((trade, index) => {
+                      const x = getTradeFeedX(trade.feedIndex);
+                      const y = (trade.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2;
+                      const isLargeTrade = trade.dollarVal >= largeTradeThresholdUsd;
+                      const radius = Math.min(
+                        11,
+                        Math.max(5, 3.5 + Math.log10(Math.max(1, trade.dollarVal)) * 1.5)
+                      );
+                      const tradeColor = trade.isBuy ? '#22c55e' : '#ef4444';
+                      const volumeLabel = formatDollarVolume(trade.dollarVal);
+                      const labelWidth = volumeLabel.length * 7 + 12;
+                      const labelGap = 14;
+                      const labelX = x + radius + labelWidth + labelGap > tradeFeedWidth
+                        ? x - radius - labelWidth - labelGap
+                        : x + radius + labelGap;
+                      const labelY = y + (index % 2 === 0 ? -20 : 20);
+
+                      return (
+                        <g
+                          key={trade.id}
+                          transform={`translate(${x} ${y})`}
+                        >
+                          <title>
+                            {`${trade.isBuy ? 'Buy' : 'Sell'} ${formatDollarVolume(trade.dollarVal)} @ ${trade.price} (${trade.time})`}
+                          </title>
+                          {isLargeTrade ? (
+                            <>
+                              <rect
+                                x={-radius - 1}
+                                y={-radius - 1}
+                                width={(radius + 1) * 2}
+                                height={(radius + 1) * 2}
+                                fill="#11141c"
+                              />
+                              <rect
+                                x={-radius}
+                                y={-radius}
+                                width={radius * 2}
+                                height={radius * 2}
+                                fill={tradeColor}
+                                stroke="#fff"
+                                strokeWidth="1.5"
+                                vectorEffect="non-scaling-stroke"
+                              />
+                            </>
+                          ) : (
+                            <>
+                              <circle cx="0" cy="0" r={radius + 1.5} fill="#11141c" />
+                              <circle
+                                cx="0"
+                                cy="0"
+                                r={radius}
+                                fill={tradeColor}
+                                stroke="#fff"
+                                strokeWidth="1.25"
+                                vectorEffect="non-scaling-stroke"
+                              />
+                            </>
+                          )}
+                          {isLargeTrade && (
+                            <g>
+                              <rect
+                                x={labelX - x}
+                                y={labelY - y - 9}
+                                width={labelWidth}
+                                height="18"
+                                rx="4"
+                                fill="#0b0e14"
+                                stroke={tradeColor}
+                                strokeWidth="1.5"
+                                vectorEffect="non-scaling-stroke"
+                              />
+                              <text
+                                x={labelX - x + 6}
+                                y={labelY - y + 4}
+                                fill="#fff"
+                                fontSize="12"
+                                fontWeight="800"
+                                fontFamily="ui-monospace, SFMono-Regular, monospace"
+                                vectorEffect="non-scaling-stroke"
+                              >
+                                {volumeLabel}
+                              </text>
+                            </g>
+                          )}
+                        </g>
+                      );
+                    })}
+                  </svg>
+                </div>
+              </div>
+              {visibleLargeOrderBands.map((band) => (
                 <div
                   key={`large-order-${band.id}`}
                   style={{ gridTemplateColumns: domGridTemplateColumns, top: `${band.start * ROW_HEIGHT}px`, height: `${(band.end - band.start + 1) * ROW_HEIGHT}px` }}
