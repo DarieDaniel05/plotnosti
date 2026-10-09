@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useMemo, useCallback } from 'react';
 import { createChart } from 'lightweight-charts';
 
 const TIMEFRAMES = [
@@ -24,7 +24,7 @@ const VISIBLE_BUFFER = 10;
 const TRADE_FEED_DISPLAY_COUNT = 8;
 const DOM_COLUMN_MIN_WIDTHS = [48, 48, 80, 96];
 const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
-const LARGE_TRADE_THRESHOLD_USD = 1000;
+const DEFAULT_LARGE_TRADE_THRESHOLD_USD = 1000;
 const getClusterWindowStart = (timestamp) =>
   Math.floor(timestamp / CLUSTER_WINDOW_MS) * CLUSTER_WINDOW_MS;
 
@@ -163,6 +163,16 @@ export default function DeepLiquidityHeatmapChart() {
     getStoredNumber('hv_price_step_percent', 0.1, (value) => value > 0)
   );
   const [inputValue, setInputValue] = useState(() => priceStepPercent.toString());
+  const [largeTradeThresholdUsd, setLargeTradeThresholdUsd] = useState(() =>
+    getStoredNumber(
+      'hv_big_trade_threshold_usd',
+      DEFAULT_LARGE_TRADE_THRESHOLD_USD,
+      (value) => value >= 0
+    )
+  );
+  const [largeTradeThresholdInput, setLargeTradeThresholdInput] = useState(() =>
+    largeTradeThresholdUsd.toString()
+  );
   const [fixedAnchorPrice, setFixedAnchorPrice] = useState(null);
 
   const [trades, setTrades] = useState([]);
@@ -182,6 +192,18 @@ export default function DeepLiquidityHeatmapChart() {
   const domResizeRef = useRef(null);
   const domColumnHeaderRef = useRef(null);
   const tradeFeedColumnRef = useRef(null);
+  const tradeFeedSvgRef = useRef(null);
+  const tradeFeedLineRef = useRef(null);
+  const tradeFeedPositionsRef = useRef(new Map());
+  const tradeFeedAnimationFrameRef = useRef(null);
+  const tradeFeedPointOrderRef = useRef([]);
+
+  useEffect(() => () => {
+    if (tradeFeedAnimationFrameRef.current !== null) {
+      cancelAnimationFrame(tradeFeedAnimationFrameRef.current);
+      tradeFeedAnimationFrameRef.current = null;
+    }
+  }, []);
 
   useEffect(() => {
     localStorage.setItem('hv_min_liquidity_usd', minLiquidityUsd.toString());
@@ -190,6 +212,10 @@ export default function DeepLiquidityHeatmapChart() {
   useEffect(() => {
     localStorage.setItem('hv_price_step_percent', priceStepPercent.toString());
   }, [priceStepPercent]);
+
+  useEffect(() => {
+    localStorage.setItem('hv_big_trade_threshold_usd', largeTradeThresholdUsd.toString());
+  }, [largeTradeThresholdUsd]);
 
   useEffect(() => {
     let timerId;
@@ -1350,18 +1376,6 @@ export default function DeepLiquidityHeatmapChart() {
     );
   }, [currentPrice, priceLevels, tickStep]);
 
-  const largeTradeThresholdUsd = useMemo(() => {
-    const recentTradeValues = trades
-      .map((trade) => trade.dollarVal)
-      .filter((value) => Number.isFinite(value) && value > 0)
-      .sort((a, b) => a - b);
-
-    if (recentTradeValues.length < 10) return LARGE_TRADE_THRESHOLD_USD;
-
-    const percentileIndex = Math.ceil(recentTradeValues.length * 0.9) - 1;
-    return recentTradeValues[percentileIndex];
-  }, [trades]);
-
   const tradesByLevel = useMemo(() => {
     const levels = new Map();
     const basePosition = priceLevels.findIndex((level) => level.index === 2000);
@@ -1557,6 +1571,103 @@ export default function DeepLiquidityHeatmapChart() {
       start: Math.max(band.start, visibleTradeStart),
       end: Math.min(band.end, visibleTradeEnd),
     }));
+
+  useLayoutEffect(() => {
+    const svg = tradeFeedSvgRef.current;
+    if (!svg) return;
+    if (tradeFeedAnimationFrameRef.current !== null) {
+      cancelAnimationFrame(tradeFeedAnimationFrameRef.current);
+      tradeFeedAnimationFrameRef.current = null;
+    }
+
+    const now = performance.now();
+    const activeIds = new Set();
+    const positions = tradeFeedPositionsRef.current;
+
+    svg.querySelectorAll('[data-trade-id]').forEach((node) => {
+      const id = node.getAttribute('data-trade-id');
+      const targetX = Number(node.getAttribute('data-target-x'));
+      const targetY = Number(node.getAttribute('data-target-y'));
+      if (id === null || !Number.isFinite(targetX) || !Number.isFinite(targetY)) return;
+      activeIds.add(id);
+
+      let position = positions.get(id);
+      if (!position) {
+        position = {
+          node,
+          fromX: targetX,
+          toX: targetX,
+          y: targetY,
+          startTime: now,
+          duration: 0,
+        };
+        positions.set(id, position);
+      } else {
+        const progress = position.duration === 0
+          ? 1
+          : Math.min(1, (now - position.startTime) / position.duration);
+        const easedProgress = 1 - (1 - progress) ** 3;
+        const currentX = position.fromX + (position.toX - position.fromX) * easedProgress;
+
+        position.node = node;
+        position.y = targetY;
+        if (Math.abs(position.toX - targetX) > 0.1) {
+          position.fromX = currentX;
+          position.toX = targetX;
+          position.startTime = now;
+          position.duration = 120;
+        } else if (progress === 1) {
+          position.fromX = targetX;
+          position.toX = targetX;
+          position.duration = 0;
+        }
+      }
+    });
+
+    positions.forEach((_, id) => {
+      if (!activeIds.has(id)) positions.delete(id);
+    });
+    tradeFeedPointOrderRef.current = Array.from(activeIds);
+
+    const updatePositions = (frameTime) => {
+      let isAnimating = false;
+      positions.forEach((position) => {
+        const progress = position.duration === 0
+          ? 1
+          : Math.min(1, (frameTime - position.startTime) / position.duration);
+        const easedProgress = 1 - (1 - progress) ** 3;
+        const x = position.fromX + (position.toX - position.fromX) * easedProgress;
+        position.node.setAttribute('transform', `translate(${x} ${position.y})`);
+        if (progress < 1) isAnimating = true;
+      });
+
+      const line = tradeFeedLineRef.current;
+      if (line) {
+        const points = tradeFeedPointOrderRef.current
+          .map((id) => {
+            const position = positions.get(id);
+            if (!position) return null;
+            const progress = position.duration === 0
+              ? 1
+              : Math.min(1, (frameTime - position.startTime) / position.duration);
+            const easedProgress = 1 - (1 - progress) ** 3;
+            const x = position.fromX + (position.toX - position.fromX) * easedProgress;
+            return `${x},${position.y}`;
+          })
+          .filter(Boolean)
+          .join(' ');
+        line.setAttribute('points', points);
+      }
+
+      if (isAnimating) {
+        tradeFeedAnimationFrameRef.current = requestAnimationFrame(updatePositions);
+      } else {
+        tradeFeedAnimationFrameRef.current = null;
+      }
+    };
+
+    updatePositions(now);
+  }, [visibleTradePoints, visibleTradeStart, tradeFeedWidth]);
 
   const visibleRows = useMemo(() => {
     const rows = [];
@@ -1898,9 +2009,9 @@ export default function DeepLiquidityHeatmapChart() {
           >
             <span className="h-12 w-1 rounded-full bg-gray-500/60 transition-colors hover:bg-blue-400" />
           </div>
-          <div className="px-3 py-2 bg-[#171c28] border-b border-gray-800 flex justify-between items-center text-gray-400 text-[10px] md:text-[11px]">
-            <span>Pas Preț (%):</span>
+          <div className="px-3 py-2 bg-[#171c28] border-b border-gray-800 flex flex-wrap justify-between items-center gap-2 text-gray-400 text-[10px] md:text-[11px]">
             <div className="flex items-center gap-1">
+              <span>Pas Preț (%):</span>
               <input
                 type="text"
                 value={inputValue}
@@ -1910,6 +2021,27 @@ export default function DeepLiquidityHeatmapChart() {
                 className="w-16 bg-[#0b0e14] border border-gray-700 rounded px-1 py-0.5 text-center text-white font-bold focus:outline-none"
               />
               <span>%</span>
+            </div>
+            <div className="flex items-center gap-1 text-[9px]">
+              <label htmlFor="big-trade-threshold" className="whitespace-nowrap">
+                BIG $:
+              </label>
+              <input
+                id="big-trade-threshold"
+                type="text"
+                inputMode="decimal"
+                value={largeTradeThresholdInput}
+                onChange={(event) => {
+                  const value = event.target.value;
+                  setLargeTradeThresholdInput(value);
+                  if (value !== '' && Number.isFinite(Number(value)) && Number(value) >= 0) {
+                    setLargeTradeThresholdUsd(Number(value));
+                  }
+                }}
+                onBlur={() => setLargeTradeThresholdInput(largeTradeThresholdUsd.toString())}
+                className="w-16 min-w-0 rounded border border-gray-700 bg-[#0b0e14] px-1 py-0.5 text-right text-white focus:border-blue-500 focus:outline-none"
+                aria-label="Big trade threshold in US dollars"
+              />
             </div>
           </div>
 
@@ -1931,15 +2063,7 @@ export default function DeepLiquidityHeatmapChart() {
                     <span className="text-[8px] font-medium text-blue-300">{clusterWindowEnd}</span>
                   </span>
                 ) : index === 1 ? (
-                  <span
-                    className="flex min-w-0 items-center gap-1"
-                    title="Big-trade cutoff is estimated from the 90th percentile of recent aggregate trades for this symbol."
-                  >
-                    <span>{title}</span>
-                    <span className="text-[8px] font-medium text-amber-300">
-                      BIG ≥ {formatDollarVolume(largeTradeThresholdUsd)}
-                    </span>
-                  </span>
+                  <span>{title}</span>
                 ) : title}
                 {index < 3 && (
                   <span
@@ -2087,6 +2211,7 @@ export default function DeepLiquidityHeatmapChart() {
                   style={{ gridColumn: 2, height: `${visibleTradeHeight}px` }}
                 >
                   <svg
+                    ref={tradeFeedSvgRef}
                     className="h-full w-full"
                     viewBox={`0 0 ${tradeFeedWidth} ${visibleTradeHeight}`}
                     preserveAspectRatio="none"
@@ -2095,6 +2220,7 @@ export default function DeepLiquidityHeatmapChart() {
                   >
                       {visibleTradePoints.length > 1 && (
                         <polyline
+                          ref={tradeFeedLineRef}
                           points={visibleTradePoints
                             .map((trade) => {
                               const x = getTradeFeedX(trade.feedIndex);
@@ -2109,7 +2235,7 @@ export default function DeepLiquidityHeatmapChart() {
                           vectorEffect="non-scaling-stroke"
                         />
                       )}
-                      {visibleTradePoints.map((trade, index) => {
+                      {visibleTradePoints.map((trade) => {
                       const x = getTradeFeedX(trade.feedIndex);
                       const y = (trade.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2;
                       const isLargeTrade = trade.dollarVal >= largeTradeThresholdUsd;
@@ -2119,17 +2245,15 @@ export default function DeepLiquidityHeatmapChart() {
                       );
                       const tradeColor = trade.isBuy ? '#22c55e' : '#ef4444';
                       const volumeLabel = formatDollarVolume(trade.dollarVal);
-                      const labelWidth = volumeLabel.length * 7 + 12;
-                      const labelGap = 14;
-                      const labelX = x + radius + labelWidth + labelGap > tradeFeedWidth
-                        ? x - radius - labelWidth - labelGap
-                        : x + radius + labelGap;
-                      const labelY = y + (index % 2 === 0 ? -20 : 20);
+                      const labelWidth = volumeLabel.length * 6 + 10;
 
                       return (
                         <g
                           key={trade.id}
                           transform={`translate(${x} ${y})`}
+                          data-trade-id={trade.id}
+                          data-target-x={x}
+                          data-target-y={y}
                         >
                           <title>
                             {`${trade.isBuy ? 'Buy' : 'Sell'} ${formatDollarVolume(trade.dollarVal)} @ ${trade.price} (${trade.time})`}
@@ -2137,22 +2261,36 @@ export default function DeepLiquidityHeatmapChart() {
                           {isLargeTrade ? (
                             <>
                               <rect
-                                x={-radius - 1}
-                                y={-radius - 1}
-                                width={(radius + 1) * 2}
-                                height={(radius + 1) * 2}
+                                x={-labelWidth / 2 - 1}
+                                y="-10"
+                                width={labelWidth + 2}
+                                height="20"
+                                rx="3"
                                 fill="#11141c"
                               />
                               <rect
-                                x={-radius}
-                                y={-radius}
-                                width={radius * 2}
-                                height={radius * 2}
+                                x={-labelWidth / 2}
+                                y="-9"
+                                width={labelWidth}
+                                height="18"
+                                rx="2"
                                 fill={tradeColor}
                                 stroke="#fff"
                                 strokeWidth="1.5"
                                 vectorEffect="non-scaling-stroke"
                               />
+                              <text
+                                x="0"
+                                y="3.5"
+                                fill="#fff"
+                                textAnchor="middle"
+                                fontSize="10"
+                                fontWeight="800"
+                                fontFamily="ui-monospace, SFMono-Regular, monospace"
+                                vectorEffect="non-scaling-stroke"
+                              >
+                                {volumeLabel}
+                              </text>
                             </>
                           ) : (
                             <>
@@ -2167,32 +2305,6 @@ export default function DeepLiquidityHeatmapChart() {
                                 vectorEffect="non-scaling-stroke"
                               />
                             </>
-                          )}
-                          {isLargeTrade && (
-                            <g>
-                              <rect
-                                x={labelX - x}
-                                y={labelY - y - 9}
-                                width={labelWidth}
-                                height="18"
-                                rx="4"
-                                fill="#0b0e14"
-                                stroke={tradeColor}
-                                strokeWidth="1.5"
-                                vectorEffect="non-scaling-stroke"
-                              />
-                              <text
-                                x={labelX - x + 6}
-                                y={labelY - y + 4}
-                                fill="#fff"
-                                fontSize="12"
-                                fontWeight="800"
-                                fontFamily="ui-monospace, SFMono-Regular, monospace"
-                                vectorEffect="non-scaling-stroke"
-                              >
-                                {volumeLabel}
-                              </text>
-                            </g>
                           )}
                         </g>
                       );
