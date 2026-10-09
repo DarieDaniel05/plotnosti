@@ -46,6 +46,17 @@ const formatDollarVolume = (valInDollars) => {
   return `$${valInDollars.toFixed(0)}`;
 };
 
+const formatCompactNumber = (value) => {
+  if (!Number.isFinite(value)) return '--';
+  if (Math.abs(value) >= 1000000000) return `${(value / 1000000000).toFixed(2)}B`;
+  if (Math.abs(value) >= 1000000) return `${(value / 1000000).toFixed(2)}M`;
+  if (Math.abs(value) >= 1000) return `${(value / 1000).toFixed(2)}K`;
+  return value.toLocaleString(undefined, { maximumFractionDigits: 2 });
+};
+
+const formatCompactCurrency = (value) =>
+  Number.isFinite(value) ? `$${formatCompactNumber(value)}` : '--';
+
 const getStoredNumber = (key, fallback, isValid) => {
   const storedValue = localStorage.getItem(key);
   if (storedValue === null) return fallback;
@@ -107,11 +118,20 @@ export default function DeepLiquidityHeatmapChart() {
   useEffect(() => {
     localStorage.setItem('hv_symbol', symbol);
   }, [symbol]);
+
   const [searchSymbol, setSearchSymbol] = useState('');
   const [symbolsList, setSymbolsList] = useState([]);
   const [timeframe, setTimeframe] = useState('1m');
   const [orderBook, setOrderBook] = useState({ bids: {}, asks: {} });
   const [currentPrice, setCurrentPrice] = useState(null);
+  const [coinStats, setCoinStats] = useState({
+    priceChangePercent: null,
+    highPrice: null,
+    lowPrice: null,
+    baseVolume: null,
+    quoteVolume: null,
+    openInterest: null,
+  });
   const [isSearchOpen, setIsSearchOpen] = useState(false);
   const [dropdownPos, setDropdownPos] = useState({ top: 0, left: 0, width: 220 });
   const [selectedIdx, setSelectedIdx] = useState(-1);
@@ -187,6 +207,8 @@ export default function DeepLiquidityHeatmapChart() {
   const chartInstanceRef = useRef(null);
   const candlestickSeriesRef = useRef(null);
   const volumeSeriesRef = useRef(null);
+  const priceLoadedForSymbolRef = useRef(null);
+  const initialCenterKeyRef = useRef(null);
   const currentCandleRef = useRef(null);
   const domContainerRef = useRef(null);
   const searchInputRef = useRef(null);
@@ -194,6 +216,47 @@ export default function DeepLiquidityHeatmapChart() {
   const localOrderBookRef = useRef({ bids: {}, asks: {} });
   const activeLiquidityRef = useRef({});
   const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
+
+  useEffect(() => {
+    let disposed = false;
+    let requestInFlight = false;
+
+    const loadOpenInterest = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+
+      try {
+        const response = await fetch(
+          `${FUTURES_REST}/openInterest?symbol=${symbol.toUpperCase()}`
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+        const data = await response.json();
+        if (data.code) throw new Error(data.msg || 'Binance API error');
+        if (!disposed) {
+          const openInterest = Number(data.openInterest);
+          setCoinStats((current) => ({
+            ...current,
+            openInterest: Number.isFinite(openInterest) ? openInterest : null,
+          }));
+        }
+      } catch (err) {
+        if (!disposed) {
+          console.error('Eroare la încărcarea Open Interest:', err);
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+
+    loadOpenInterest();
+    const intervalId = setInterval(loadOpenInterest, 30 * 1000);
+
+    return () => {
+      disposed = true;
+      clearInterval(intervalId);
+    };
+  }, [symbol]);
 
   const beginPanelResize = (event) => {
     event.preventDefault();
@@ -360,8 +423,18 @@ export default function DeepLiquidityHeatmapChart() {
 
   // Resetarea datelor la schimbarea simbolului
   useEffect(() => {
+    priceLoadedForSymbolRef.current = null;
+    initialCenterKeyRef.current = null;
     setFixedAnchorPrice(null);
     setCurrentPrice(null);
+    setCoinStats({
+      priceChangePercent: null,
+      highPrice: null,
+      lowPrice: null,
+      baseVolume: null,
+      quoteVolume: null,
+      openInterest: null,
+    });
     setOrderBook({ bids: {}, asks: {} });
     setTrades([]);
     setClusterData({
@@ -824,6 +897,7 @@ export default function DeepLiquidityHeatmapChart() {
         if (formattedCandles.length > 0) {
           const lastCandle = formattedCandles[formattedCandles.length - 1];
 
+          priceLoadedForSymbolRef.current = requestedSymbol;
           currentCandleRef.current = { ...lastCandle };
           currentPriceRef.current = lastCandle.close;
           setCurrentPrice(lastCandle.close);
@@ -902,8 +976,17 @@ export default function DeepLiquidityHeatmapChart() {
             if (data.e === '24hrTicker') {
               const price = parseFloat(data.c);
 
+              priceLoadedForSymbolRef.current = symbol.toUpperCase();
               currentPriceRef.current = price;
               setCurrentPrice(price);
+              setCoinStats((current) => ({
+                ...current,
+                priceChangePercent: parseFloat(data.P),
+                highPrice: parseFloat(data.h),
+                lowPrice: parseFloat(data.l),
+                baseVolume: parseFloat(data.v),
+                quoteVolume: parseFloat(data.q),
+              }));
 
               if (candlestickSeriesRef.current && currentCandleRef.current) {
                 const updatedCandle = {
@@ -932,6 +1015,7 @@ export default function DeepLiquidityHeatmapChart() {
               };
 
               currentCandleRef.current = candle;
+              priceLoadedForSymbolRef.current = symbol.toUpperCase();
               candlestickSeriesRef.current?.update(candle);
 
               volumeSeriesRef.current?.update({
@@ -1113,22 +1197,26 @@ export default function DeepLiquidityHeatmapChart() {
       if (domContainerRef.current && currentPriceIndex !== -1) {
         const containerH = domContainerRef.current.clientHeight;
 
-        const targetScroll =
+        const targetScroll = Math.max(0,
           currentPriceIndex * ROW_HEIGHT -
           containerH / 2 +
-          ROW_HEIGHT / 2;
+          ROW_HEIGHT / 2
+        );
 
-        domContainerRef.current.scrollTop = Math.max(0, targetScroll);
+        domContainerRef.current.scrollTop = targetScroll;
+        setScrollTop(targetScroll);
       }
     });
   }, [currentPriceIndex]);
 
   const centerDomRef = useRef(centerDom);
   centerDomRef.current = centerDom;
-  const initialCenterKeyRef = useRef(null);
 
   useEffect(() => {
-    if (currentPriceIndex === -1) return;
+    if (
+      currentPriceIndex === -1 ||
+      priceLoadedForSymbolRef.current !== symbol.toUpperCase()
+    ) return;
 
     const centerKey = `${symbol}:${activeTab}`;
     if (initialCenterKeyRef.current !== centerKey) {
@@ -1395,6 +1483,61 @@ export default function DeepLiquidityHeatmapChart() {
               <span className="text-green-400 font-bold">${currentPrice}</span>
             </div>
           )}
+        </div>
+      </div>
+
+      <div className="flex shrink-0 gap-x-5 gap-y-1 overflow-x-auto border-b border-gray-800 bg-[#0f131c] px-3 py-2 text-[10px] md:gap-x-7 md:px-4 md:text-xs">
+        <div className="shrink-0">
+          <div className="text-gray-500">24H CHANGE</div>
+          <div className={`font-semibold ${
+            coinStats.priceChangePercent > 0
+              ? 'text-green-400'
+              : coinStats.priceChangePercent < 0
+                ? 'text-red-400'
+                : 'text-gray-300'
+          }`}>
+            {Number.isFinite(coinStats.priceChangePercent)
+              ? `${coinStats.priceChangePercent > 0 ? '+' : ''}${coinStats.priceChangePercent.toFixed(2)}%`
+              : '--'}
+          </div>
+        </div>
+        <div className="shrink-0">
+          <div className="text-gray-500">24H VOLUME</div>
+          <div className="font-semibold text-gray-200">
+            {formatCompactCurrency(coinStats.quoteVolume)}
+          </div>
+        </div>
+        <div className="shrink-0">
+          <div className="text-gray-500">BASE VOLUME</div>
+          <div className="font-semibold text-gray-200">
+            {Number.isFinite(coinStats.baseVolume)
+              ? `${formatCompactNumber(coinStats.baseVolume)} ${symbol.replace(/USDT$/, '')}`
+              : '--'}
+          </div>
+        </div>
+        <div className="shrink-0">
+          <div className="text-gray-500">OPEN INTEREST</div>
+          <div className="font-semibold text-gray-200">
+            {Number.isFinite(coinStats.openInterest)
+              ? `${formatCompactNumber(coinStats.openInterest)} ${symbol.replace(/USDT$/, '')}`
+              : '--'}
+          </div>
+        </div>
+        <div className="shrink-0">
+          <div className="text-gray-500">OI VALUE</div>
+          <div className="font-semibold text-gray-200">
+            {Number.isFinite(coinStats.openInterest) && Number.isFinite(currentPrice)
+              ? formatCompactCurrency(coinStats.openInterest * currentPrice)
+              : '--'}
+          </div>
+        </div>
+        <div className="shrink-0">
+          <div className="text-gray-500">24H HIGH / LOW</div>
+          <div className="font-semibold text-gray-200">
+            {Number.isFinite(coinStats.highPrice) && Number.isFinite(coinStats.lowPrice)
+              ? `${coinStats.highPrice} / ${coinStats.lowPrice}`
+              : '--'}
+          </div>
         </div>
       </div>
 
