@@ -21,6 +21,7 @@ const TIMEFRAME_SECONDS = {
 
 const ROW_HEIGHT = 20;
 const VISIBLE_BUFFER = 10;
+const DOM_COLUMN_MIN_WIDTHS = [48, 48, 80, 96];
 const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
 const LARGE_TRADE_THRESHOLD_USD = 1000;
 const getClusterWindowStart = (timestamp) =>
@@ -174,7 +175,7 @@ export default function DeepLiquidityHeatmapChart() {
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(600);
   const [domPanelWidth, setDomPanelWidth] = useState(520);
-  const [domColumnWidths, setDomColumnWidths] = useState([1, 1.4, 1.1, 1.1]);
+  const [domColumnWidths, setDomColumnWidths] = useState([0, 1, 0.3, 0.4]);
 
   const domResizeRef = useRef(null);
   const domColumnHeaderRef = useRef(null);
@@ -309,10 +310,20 @@ export default function DeepLiquidityHeatmapChart() {
       const { columnIndex, startWidths, gridWidth } = resize;
       const totalWeight = startWidths.reduce((total, width) => total + width, 0);
       const pairWeight = startWidths[columnIndex] + startWidths[columnIndex + 1];
-      const minWeight = Math.min(pairWeight / 2, (48 / gridWidth) * totalWeight);
+      const minLeftWeight = Math.min(
+        pairWeight / 2,
+        (DOM_COLUMN_MIN_WIDTHS[columnIndex] / gridWidth) * totalWeight
+      );
+      const minRightWeight = Math.min(
+        pairWeight / 2,
+        (DOM_COLUMN_MIN_WIDTHS[columnIndex + 1] / gridWidth) * totalWeight
+      );
       const nextLeftWidth = Math.min(
-        pairWeight - minWeight,
-        Math.max(minWeight, startWidths[columnIndex] + (deltaX / gridWidth) * totalWeight)
+        pairWeight - minRightWeight,
+        Math.max(
+          minLeftWeight,
+          startWidths[columnIndex] + (deltaX / gridWidth) * totalWeight
+        )
       );
       const nextWidths = [...startWidths];
       nextWidths[columnIndex] = nextLeftWidth;
@@ -333,7 +344,7 @@ export default function DeepLiquidityHeatmapChart() {
   }, []);
 
   const domGridTemplateColumns = domColumnWidths
-    .map((width) => `minmax(0, ${width}fr)`)
+    .map((width, index) => `minmax(${DOM_COLUMN_MIN_WIDTHS[index]}px, ${width}fr)`)
     .join(' ');
 
   // Ref-uri citite de WebSocket / fetch, ca să nu re-creăm conexiunile la fiecare tick de preț
@@ -853,7 +864,7 @@ export default function DeepLiquidityHeatmapChart() {
         vertLines: { color: '#161b26' },
         horzLines: { color: '#161b26' },
       },
-      crosshair: { mode: 1 },
+      crosshair: { mode: 0 },
       localization: {
         priceFormatter: (price) => {
           if (typeof price !== 'number') return '';
