@@ -202,11 +202,16 @@ export default function DeepLiquidityHeatmapChart() {
   const tradeFeedPositionsRef = useRef(new Map());
   const tradeFeedAnimationFrameRef = useRef(null);
   const tradeFeedPointOrderRef = useRef([]);
+  const centerDomAnimationRef = useRef(null);
 
   useEffect(() => () => {
     if (tradeFeedAnimationFrameRef.current !== null) {
       cancelAnimationFrame(tradeFeedAnimationFrameRef.current);
       tradeFeedAnimationFrameRef.current = null;
+    }
+    if (centerDomAnimationRef.current !== null) {
+      cancelAnimationFrame(centerDomAnimationRef.current);
+      centerDomAnimationRef.current = null;
     }
   }, []);
 
@@ -258,6 +263,7 @@ export default function DeepLiquidityHeatmapChart() {
   const rulerRef = useRef(null);
   const rulerPhaseRef = useRef('idle');
   const priceLoadedForSymbolRef = useRef(null);
+  const pendingDomCenterSymbolRef = useRef(null);
   const currentCandleRef = useRef(null);
   const domContainerRef = useRef(null);
   const searchInputRef = useRef(null);
@@ -1577,20 +1583,40 @@ export default function DeepLiquidityHeatmapChart() {
   }, [tradeFeedPoints, currentPriceIndex, largeTradeThresholdUsd]);
 
   const centerDom = useCallback(() => {
-    requestAnimationFrame(() => {
-      if (domContainerRef.current && currentPriceIndex !== -1) {
-        const containerH = domContainerRef.current.clientHeight;
+    const container = domContainerRef.current;
+    if (!container || currentPriceIndex === -1) return;
 
-        const targetScroll = Math.max(0,
-          currentPriceIndex * ROW_HEIGHT -
-          containerH / 2 +
-          ROW_HEIGHT / 2
-        );
+    if (centerDomAnimationRef.current !== null) {
+      cancelAnimationFrame(centerDomAnimationRef.current);
+      centerDomAnimationRef.current = null;
+    }
 
-        domContainerRef.current.scrollTop = targetScroll;
-        setScrollTop(targetScroll);
+    const containerH = container.clientHeight;
+    const targetScroll = Math.max(
+      0,
+      currentPriceIndex * ROW_HEIGHT - containerH / 2 + ROW_HEIGHT / 2
+    );
+    const startScroll = container.scrollTop;
+    const startTime = performance.now();
+    const duration = 220;
+
+    const animate = (now) => {
+      const elapsed = now - startTime;
+      const progress = Math.min(1, elapsed / duration);
+      const eased = 1 - (1 - progress) ** 3;
+      const nextScroll = startScroll + (targetScroll - startScroll) * eased;
+
+      container.scrollTop = nextScroll;
+      setScrollTop(nextScroll);
+
+      if (progress < 1) {
+        centerDomAnimationRef.current = requestAnimationFrame(animate);
+      } else {
+        centerDomAnimationRef.current = null;
       }
-    });
+    };
+
+    centerDomAnimationRef.current = requestAnimationFrame(animate);
   }, [currentPriceIndex]);
 
   const centerDomRef = useRef(centerDom);
@@ -1598,13 +1624,28 @@ export default function DeepLiquidityHeatmapChart() {
 
   useEffect(() => {
     if (
-      !keepDomCentered ||
+      pendingDomCenterSymbolRef.current !== symbol ||
+      priceLoadedForSymbolRef.current !== symbol.toUpperCase() ||
       currentPriceIndex === -1 ||
-      priceLoadedForSymbolRef.current !== symbol.toUpperCase()
+      !domContainerRef.current
     ) return;
 
-    centerDomRef.current();
-  }, [keepDomCentered, symbol, activeTab, currentPriceIndex]);
+    pendingDomCenterSymbolRef.current = null;
+    const frameId = requestAnimationFrame(() => centerDomRef.current());
+    return () => cancelAnimationFrame(frameId);
+  }, [symbol, currentPriceIndex, centerDom]);
+
+  useEffect(() => {
+    if (!keepDomCentered || currentPriceIndex === -1 || !domContainerRef.current) return;
+
+    const frameId = requestAnimationFrame(() => {
+      if (domContainerRef.current && currentPriceIndex !== -1) {
+        centerDomRef.current();
+      }
+    });
+
+    return () => cancelAnimationFrame(frameId);
+  }, [keepDomCentered, symbol, currentPriceIndex, centerDom]);
 
   useEffect(() => {
     const intervalId = setInterval(() => {
@@ -1836,6 +1877,19 @@ export default function DeepLiquidityHeatmapChart() {
     return `${diff > 0 ? '+' : ''}${diff.toFixed(2)}%`;
   };
 
+  const selectSymbol = useCallback((nextSymbol) => {
+    const next = typeof nextSymbol === 'string' ? nextSymbol.toUpperCase() : nextSymbol;
+    if (!next || next === symbol) return;
+
+    pendingDomCenterSymbolRef.current = next;
+    setSymbol(next);
+    setIsSearchOpen(false);
+    setSearchSymbol('');
+    setSelectedIdx(-1);
+    setScrollTop(0);
+    if (domContainerRef.current) domContainerRef.current.scrollTop = 0;
+  }, [symbol]);
+
   return (
     <div className={`flex flex-col w-full bg-[#0b0e14] text-gray-200 font-sans ${
       activeTab === 'dom'
@@ -1887,7 +1941,10 @@ export default function DeepLiquidityHeatmapChart() {
       else if (e.key === 'Escape') { setIsSearchOpen(false); setSearchSymbol(''); setSelectedIdx(-1); e.target.blur(); }
       else if (e.key === 'Enter') {
         const pick = selectedIdx >= 0 ? filtered[selectedIdx] : filtered[0];
-        if (pick) { setSymbol(pick); setIsSearchOpen(false); setSearchSymbol(''); setSelectedIdx(-1); e.target.blur(); }
+        if (pick) {
+          selectSymbol(pick);
+          e.target.blur();
+        }
       }
     }}
     onBlur={() => { setTimeout(() => { setIsSearchOpen(false); setSelectedIdx(-1); }, 180); }}
@@ -1915,7 +1972,7 @@ export default function DeepLiquidityHeatmapChart() {
               <button type="button" key={sym}
                 onMouseDown={(e) => e.preventDefault()}
                 onMouseEnter={() => setSelectedIdx(idx)}
-                onClick={() => { setSymbol(sym); setIsSearchOpen(false); setSearchSymbol(''); setSelectedIdx(-1); }}
+                onClick={() => selectSymbol(sym)}
                 style={{ width: '100%', textAlign: 'left', padding: '7px 12px', fontSize: 13, fontFamily: 'monospace', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 8, background: isHL ? '#2b2f3e' : isActive ? 'rgba(59,130,246,0.15)' : 'transparent', color: isActive ? '#60a5fa' : '#e5e7eb', borderBottom: '1px solid rgba(255,255,255,0.04)' }}>
                 {q2 && ms >= 0
                   ? <span>{sym.slice(0,ms)}<span style={{ color:'#facc15', fontWeight:700 }}>{sym.slice(ms,ms+q2.length)}</span>{sym.slice(ms+q2.length)}</span>
