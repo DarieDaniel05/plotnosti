@@ -27,6 +27,14 @@ const formatDollarVolume = (valInDollars) => {
   return `$${valInDollars.toFixed(0)}`;
 };
 
+const getStoredNumber = (key, fallback, isValid) => {
+  const storedValue = localStorage.getItem(key);
+  if (storedValue === null) return fallback;
+
+  const value = Number(storedValue);
+  return Number.isFinite(value) && isValid(value) ? value : fallback;
+};
+
 // Conexiune WebSocket cu reconectare automată (pauză 1s → 15s).
 // Returnează o funcție care închide definitiv conexiunea.
 const createReconnectingSocket = (url, { onOpen, onMessage }) => {
@@ -96,11 +104,15 @@ export default function DeepLiquidityHeatmapChart() {
   // Stări pentru comutarea vizibilității și pragul de lichiditate minimă
   const [showLiquidity, setShowLiquidity] = useState(true);
   const [showSweeps, setShowSweeps] = useState(true);
-  const [minLiquidityUsd, setMinLiquidityUsd] = useState(10000);
-  const [minLiquidityInput, setMinLiquidityInput] = useState('10000');
+  const [minLiquidityUsd, setMinLiquidityUsd] = useState(() =>
+    getStoredNumber('hv_min_liquidity_usd', 10000, (value) => value >= 0)
+  );
+  const [minLiquidityInput, setMinLiquidityInput] = useState(() => minLiquidityUsd.toString());
 
-  const [priceStepPercent, setPriceStepPercent] = useState(0.1);
-  const [inputValue, setInputValue] = useState('0.1');
+  const [priceStepPercent, setPriceStepPercent] = useState(() =>
+    getStoredNumber('hv_price_step_percent', 0.1, (value) => value > 0)
+  );
+  const [inputValue, setInputValue] = useState(() => priceStepPercent.toString());
   const [autoCenter, setAutoCenter] = useState(true);
   const [fixedAnchorPrice, setFixedAnchorPrice] = useState(null);
 
@@ -108,6 +120,14 @@ export default function DeepLiquidityHeatmapChart() {
 
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(600);
+
+  useEffect(() => {
+    localStorage.setItem('hv_min_liquidity_usd', minLiquidityUsd.toString());
+  }, [minLiquidityUsd]);
+
+  useEffect(() => {
+    localStorage.setItem('hv_price_step_percent', priceStepPercent.toString());
+  }, [priceStepPercent]);
 
   const chartContainerRef = useRef(null);
   const chartCanvasOverlayRef = useRef(null);
@@ -121,7 +141,6 @@ export default function DeepLiquidityHeatmapChart() {
   const localOrderBookRef = useRef({ bids: {}, asks: {} });
   const activeLiquidityRef = useRef({});
   const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
-  const markersRef = useRef([]); // Stochează markerele de sweep pe grafic
 
   // Ref-uri citite de WebSocket / fetch, ca să nu re-creăm conexiunile la fiecare tick de preț
   const currentPriceRef = useRef(null);
@@ -140,31 +159,6 @@ export default function DeepLiquidityHeatmapChart() {
       }, 50);
     }
   }, [activeTab]);
-
-  // Adăugare marker pe grafic
-  const addSweepMarker = useCallback((time, price, type, volume) => {
-    if (!candlestickSeriesRef.current || !showSweeps) return;
-
-    const isBuySweep = type === 'BUY_SWEEP'; // Prețul a urcat și a măturat ASKS (Lichiditate Buy-side)
-
-    const newMarker = {
-      time: time,
-      position: isBuySweep ? 'aboveBar' : 'belowBar',
-      color: isBuySweep ? '#f59e0b' : '#3b82f6',
-      shape: isBuySweep ? 'arrowDown' : 'arrowUp',
-      text: `SWEEP ${formatDollarVolume(volume)}`,
-    };
-
-    // Evităm duplicatele pe aceeași lumânare / același tip
-    const exists = markersRef.current.some(
-      (m) => m.time === time && m.shape === newMarker.shape
-    );
-
-    if (!exists) {
-      markersRef.current = [...markersRef.current, newMarker].slice(-50); // Păstrăm ultimele 50
-      candlestickSeriesRef.current.setMarkers(markersRef.current);
-    }
-  }, [showSweeps]);
 
   // Sincronizare și detectare SWEEP de lichiditate
   const syncAndFilterLiquidity = useCallback((latestPrice, candleHigh, candleLow) => {
@@ -199,9 +193,7 @@ export default function DeepLiquidityHeatmapChart() {
       Object.keys(activeAskLevels).forEach((pStr) => {
         const p = parseFloat(pStr);
         if (latestPrice >= p) {
-          const sweptVolume = activeAskLevels[p];
-          sweptLiquidityRef.current.push({ price: p, volume: sweptVolume, timestamp: now, type: 'BUY_SWEEP' });
-          if (currentCandleRef.current) addSweepMarker(currentCandleRef.current.time, p, 'BUY_SWEEP', sweptVolume);
+          sweptLiquidityRef.current.push({ price: p, timestamp: now, type: 'BUY_SWEEP' });
           delete currentActive[p];
         }
       });
@@ -210,9 +202,7 @@ export default function DeepLiquidityHeatmapChart() {
       Object.keys(activeBidLevels).forEach((pStr) => {
         const p = parseFloat(pStr);
         if (latestPrice <= p) {
-          const sweptVolume = activeBidLevels[p];
-          sweptLiquidityRef.current.push({ price: p, volume: sweptVolume, timestamp: now, type: 'SELL_SWEEP' });
-          if (currentCandleRef.current) addSweepMarker(currentCandleRef.current.time, p, 'SELL_SWEEP', sweptVolume);
+          sweptLiquidityRef.current.push({ price: p, timestamp: now, type: 'SELL_SWEEP' });
           delete currentActive[p];
         }
       });
@@ -221,7 +211,7 @@ export default function DeepLiquidityHeatmapChart() {
     }
 
     activeLiquidityRef.current = currentActive;
-  }, [minLiquidityUsd, addSweepMarker]);
+  }, [minLiquidityUsd]);
 
   // Versiunea curentă a funcției, disponibilă pentru WebSocket fără dependențe în efecte
   syncRef.current = syncAndFilterLiquidity;
@@ -263,11 +253,6 @@ export default function DeepLiquidityHeatmapChart() {
     localOrderBookRef.current = { bids: {}, asks: {} };
     activeLiquidityRef.current = {};
     sweptLiquidityRef.current = [];
-    markersRef.current = [];
-
-    if (candlestickSeriesRef.current) {
-      candlestickSeriesRef.current.setMarkers([]);
-    }
 
     if (domContainerRef.current) {
       domContainerRef.current.scrollTop = 0;
@@ -566,17 +551,6 @@ export default function DeepLiquidityHeatmapChart() {
         ctx.lineTo(width, yCoord);
         ctx.stroke();
         ctx.restore();
-
-        // Etichetă "SWEEP"
-        ctx.fillStyle = sweep.type === 'BUY_SWEEP'
-          ? `rgba(245, 158, 11, ${fadeRatio * 0.9})`
-          : `rgba(59, 130, 246, ${fadeRatio * 0.9})`;
-        ctx.font = 'bold 10px sans-serif';
-        ctx.fillText(
-          `⚡ SWEEP: ${formatDollarVolume(sweep.volume)}`,
-          width - 130,
-          yCoord - 3
-        );
       });
     }
   }, [showLiquidity, showSweeps, minLiquidityUsd]);
