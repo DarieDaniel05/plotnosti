@@ -12,6 +12,25 @@ const TIMEFRAMES = [
 
 const ROW_HEIGHT = 20;
 const VISIBLE_BUFFER = 10;
+const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
+const LARGE_TRADE_THRESHOLD_USD = 1000;
+const getClusterWindowStart = (timestamp) =>
+  Math.floor(timestamp / CLUSTER_WINDOW_MS) * CLUSTER_WINDOW_MS;
+
+const getTradeLevelPosition = (price, isBuy, basePrice, tickStep, basePosition) => {
+  if (basePrice === undefined || tickStep <= 0 || basePosition < 0) return -1;
+
+  const offset = (price - basePrice) / tickStep;
+  const nearestLevel = Math.round(offset);
+  const alignedOffset = Math.abs(offset - nearestLevel) < 1e-8
+    ? nearestLevel
+    : offset;
+  const levelOffset = isBuy
+    ? Math.floor(alignedOffset)
+    : Math.ceil(alignedOffset);
+
+  return basePosition - levelOffset;
+};
 
 // Binance USDⓈ-M Futures.
 // WebSocket-ul este împărțit pe rute: /public (order book) și /market (kline, ticker, trade).
@@ -113,13 +132,23 @@ export default function DeepLiquidityHeatmapChart() {
     getStoredNumber('hv_price_step_percent', 0.1, (value) => value > 0)
   );
   const [inputValue, setInputValue] = useState(() => priceStepPercent.toString());
-  const [autoCenter, setAutoCenter] = useState(true);
   const [fixedAnchorPrice, setFixedAnchorPrice] = useState(null);
 
   const [trades, setTrades] = useState([]);
+  const [clusterData, setClusterData] = useState(() => ({
+    windowStart: getClusterWindowStart(Date.now()),
+    levels: new Map(),
+  }));
+  const clusterWindowEnd = new Date(clusterData.windowStart + CLUSTER_WINDOW_MS)
+    .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 
   const [scrollTop, setScrollTop] = useState(0);
   const [containerHeight, setContainerHeight] = useState(600);
+  const [domPanelWidth, setDomPanelWidth] = useState(520);
+  const [domColumnWidths, setDomColumnWidths] = useState([1, 1.4, 1.1, 1.1]);
+
+  const domResizeRef = useRef(null);
+  const domColumnHeaderRef = useRef(null);
 
   useEffect(() => {
     localStorage.setItem('hv_min_liquidity_usd', minLiquidityUsd.toString());
@@ -128,6 +157,30 @@ export default function DeepLiquidityHeatmapChart() {
   useEffect(() => {
     localStorage.setItem('hv_price_step_percent', priceStepPercent.toString());
   }, [priceStepPercent]);
+
+  useEffect(() => {
+    let timerId;
+    const scheduleNextReset = () => {
+      const delay = CLUSTER_WINDOW_MS - (Date.now() % CLUSTER_WINDOW_MS);
+      timerId = setTimeout(resetClusterAtNextWindow, delay);
+    };
+    const resetClusterAtNextWindow = () => {
+      const now = Date.now();
+      const currentWindowStart = getClusterWindowStart(now);
+
+      setClusterData((current) => (
+        current.windowStart === currentWindowStart
+          ? current
+          : { windowStart: currentWindowStart, levels: new Map() }
+      ));
+
+      scheduleNextReset();
+    };
+
+    scheduleNextReset();
+
+    return () => clearTimeout(timerId);
+  }, []);
 
   const chartContainerRef = useRef(null);
   const chartCanvasOverlayRef = useRef(null);
@@ -141,6 +194,73 @@ export default function DeepLiquidityHeatmapChart() {
   const localOrderBookRef = useRef({ bids: {}, asks: {} });
   const activeLiquidityRef = useRef({});
   const sweptLiquidityRef = useRef([]); // Stochează nivelurile recent măturate pentru vizualizare
+
+  const beginPanelResize = (event) => {
+    event.preventDefault();
+    domResizeRef.current = {
+      type: 'panel',
+      startX: event.clientX,
+      startWidth: domPanelWidth,
+    };
+  };
+
+  const beginColumnResize = (columnIndex, event) => {
+    event.preventDefault();
+    event.stopPropagation();
+
+    const gridWidth = domColumnHeaderRef.current?.getBoundingClientRect().width;
+    if (!gridWidth || columnIndex >= domColumnWidths.length - 1) return;
+
+    domResizeRef.current = {
+      type: 'column',
+      columnIndex,
+      startX: event.clientX,
+      startWidths: [...domColumnWidths],
+      gridWidth,
+    };
+  };
+
+  useEffect(() => {
+    const handlePointerMove = (event) => {
+      const resize = domResizeRef.current;
+      if (!resize) return;
+
+      const deltaX = event.clientX - resize.startX;
+      if (resize.type === 'panel') {
+        const maxWidth = Math.max(360, window.innerWidth - 250);
+        setDomPanelWidth(Math.min(maxWidth, Math.max(360, resize.startWidth - deltaX)));
+        return;
+      }
+
+      const { columnIndex, startWidths, gridWidth } = resize;
+      const totalWeight = startWidths.reduce((total, width) => total + width, 0);
+      const pairWeight = startWidths[columnIndex] + startWidths[columnIndex + 1];
+      const minWeight = Math.min(pairWeight / 2, (48 / gridWidth) * totalWeight);
+      const nextLeftWidth = Math.min(
+        pairWeight - minWeight,
+        Math.max(minWeight, startWidths[columnIndex] + (deltaX / gridWidth) * totalWeight)
+      );
+      const nextWidths = [...startWidths];
+      nextWidths[columnIndex] = nextLeftWidth;
+      nextWidths[columnIndex + 1] = pairWeight - nextLeftWidth;
+      setDomColumnWidths(nextWidths);
+    };
+
+    const handlePointerUp = () => {
+      domResizeRef.current = null;
+    };
+
+    window.addEventListener('pointermove', handlePointerMove);
+    window.addEventListener('pointerup', handlePointerUp);
+    return () => {
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerup', handlePointerUp);
+    };
+  }, []);
+
+  const domGridTemplateColumns = domColumnWidths
+    .map((width) => `minmax(0, ${width}fr)`)
+    .join(' ');
 
   // Ref-uri citite de WebSocket / fetch, ca să nu re-creăm conexiunile la fiecare tick de preț
   const currentPriceRef = useRef(null);
@@ -243,8 +363,11 @@ export default function DeepLiquidityHeatmapChart() {
     setFixedAnchorPrice(null);
     setCurrentPrice(null);
     setOrderBook({ bids: {}, asks: {} });
-    setAutoCenter(true);
     setTrades([]);
+    setClusterData({
+      windowStart: getClusterWindowStart(Date.now()),
+      levels: new Map(),
+    });
     setHoveredPrice(null);
     setScrollTop(0);
 
@@ -519,7 +642,7 @@ export default function DeepLiquidityHeatmapChart() {
       const r = Math.round(255 + (220 - 255) * intensity);
       const g = Math.round(140 * (1 - intensity));
       const b = Math.round(38 * intensity);
-      const alpha = 0.25 + intensity * 0.55;
+      const alpha = 0.1 + intensity * 0.25;
 
       ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
       ctx.fillRect(0, yCoord - bandHeight / 2, width, bandHeight);
@@ -644,10 +767,11 @@ export default function DeepLiquidityHeatmapChart() {
       }
     };
 
-    window.addEventListener('resize', handleResize);
+    const resizeObserver = new ResizeObserver(handleResize);
+    resizeObserver.observe(chartContainerRef.current);
 
     return () => {
-      window.removeEventListener('resize', handleResize);
+      resizeObserver.disconnect();
       chart.remove();
       chartInstanceRef.current = null;
       candlestickSeriesRef.current = null;
@@ -749,10 +873,30 @@ export default function DeepLiquidityHeatmapChart() {
                 price,
                 dollarVal,
                 isBuy: !isBuyerMaker,
+                timestamp: data.T,
                 time: new Date(data.T).toLocaleTimeString(),
               };
 
               setTrades((prev) => [newTrade, ...prev.slice(0, 49)]);
+
+              const windowStart = getClusterWindowStart(Date.now());
+              setClusterData((current) => {
+                if (windowStart < current.windowStart) return current;
+
+                const levels = windowStart === current.windowStart
+                  ? new Map(current.levels)
+                  : new Map();
+                const level = { ...(levels.get(price) || { buyVolume: 0, sellVolume: 0 }) };
+
+                if (newTrade.isBuy) {
+                  level.buyVolume += dollarVal;
+                } else {
+                  level.sellVolume += dollarVal;
+                }
+                levels.set(price, level);
+
+                return { windowStart, levels };
+              });
             }
 
             if (data.e === '24hrTicker') {
@@ -881,6 +1025,89 @@ export default function DeepLiquidityHeatmapChart() {
     );
   }, [currentPrice, priceLevels, tickStep]);
 
+  const tradesByLevel = useMemo(() => {
+    const levels = new Map();
+    const basePosition = priceLevels.findIndex((level) => level.index === 2000);
+    const basePrice = priceLevels[basePosition]?.rawPrice;
+    if (basePrice === undefined || tickStep <= 0) return levels;
+
+    if (clusterData.windowStart === getClusterWindowStart(Date.now())) {
+      clusterData.levels.forEach((volume, price) => {
+        ['buyVolume', 'sellVolume'].forEach((side) => {
+          const isBuy = side === 'buyVolume';
+          const position = getTradeLevelPosition(
+            price,
+            isBuy,
+            basePrice,
+            tickStep,
+            basePosition
+          );
+          if (position < 0 || position >= priceLevels.length) return;
+
+          const key = priceLevels[position].index;
+          let level = levels.get(key);
+          if (!level) {
+            level = { buyVolume: 0, sellVolume: 0, trades: [] };
+            levels.set(key, level);
+          }
+
+          level[side] += volume[side];
+        });
+      });
+    }
+
+    trades.forEach((trade) => {
+      const position = getTradeLevelPosition(
+        trade.price,
+        trade.isBuy,
+        basePrice,
+        tickStep,
+        basePosition
+      );
+      if (position < 0 || position >= priceLevels.length) return;
+
+      const key = priceLevels[position].index;
+      let level = levels.get(key);
+      if (!level) {
+        level = { buyVolume: 0, sellVolume: 0, trades: [] };
+        levels.set(key, level);
+      }
+      level.trades.push(trade);
+    });
+
+    return levels;
+  }, [trades, clusterData, priceLevels, tickStep]);
+
+  const largeOrderBands = useMemo(() => {
+    if (currentPriceIndex < 0) return [];
+
+    const basePosition = priceLevels.findIndex((level) => level.index === 2000);
+    const basePrice = priceLevels[basePosition]?.rawPrice;
+    if (basePrice === undefined || tickStep <= 0) return [];
+
+    return trades
+      .filter((trade) => trade.dollarVal >= LARGE_TRADE_THRESHOLD_USD)
+      .map((trade) => {
+        const tradePosition = getTradeLevelPosition(
+          trade.price,
+          trade.isBuy,
+          basePrice,
+          tickStep,
+          basePosition
+        );
+        if (tradePosition < 0 || tradePosition >= priceLevels.length) return null;
+
+        return {
+          id: trade.id,
+          isBuy: trade.isBuy,
+          start: Math.min(currentPriceIndex, tradePosition),
+          end: Math.max(currentPriceIndex, tradePosition),
+        };
+      })
+      .filter(Boolean)
+      .slice(0, 10);
+  }, [trades, currentPriceIndex, priceLevels, tickStep]);
+
   const centerDom = useCallback(() => {
     requestAnimationFrame(() => {
       if (domContainerRef.current && currentPriceIndex !== -1) {
@@ -896,20 +1123,33 @@ export default function DeepLiquidityHeatmapChart() {
     });
   }, [currentPriceIndex]);
 
+  const centerDomRef = useRef(centerDom);
+  centerDomRef.current = centerDom;
+  const initialCenterKeyRef = useRef(null);
+
   useEffect(() => {
-    if (autoCenter && currentPriceIndex !== -1) {
-      centerDom();
-      const frame = requestAnimationFrame(centerDom);
-      return () => cancelAnimationFrame(frame);
+    if (currentPriceIndex === -1) return;
+
+    const centerKey = `${symbol}:${activeTab}`;
+    if (initialCenterKeyRef.current !== centerKey) {
+      initialCenterKeyRef.current = centerKey;
+      centerDomRef.current();
     }
-  }, [symbol, currentPrice, autoCenter, centerDom, currentPriceIndex, activeTab]);
+  }, [symbol, activeTab, currentPriceIndex]);
+
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      centerDomRef.current();
+    }, 60 * 1000);
+
+    return () => clearInterval(intervalId);
+  }, [symbol, activeTab]);
 
   // Space = centrare DOM
   useEffect(() => {
     const onKey = (e) => {
       if (e.code === 'Space' && e.target.tagName !== 'INPUT') {
         e.preventDefault();
-        setAutoCenter(true);
         centerDom();
       }
     };
@@ -919,9 +1159,6 @@ export default function DeepLiquidityHeatmapChart() {
 
   const handleScroll = (e) => {
     setScrollTop(e.target.scrollTop);
-    if (autoCenter) {
-      setAutoCenter(false);
-    }
   };
 
   const totalHeight = priceLevels.length * ROW_HEIGHT;
@@ -991,7 +1228,6 @@ export default function DeepLiquidityHeatmapChart() {
       setPriceStepPercent(val);
       setInputValue(val.toString());
       setFixedAnchorPrice(currentPrice);
-      setAutoCenter(true);
     }
   };
 
@@ -1190,7 +1426,7 @@ export default function DeepLiquidityHeatmapChart() {
       <div className="flex flex-1 overflow-hidden relative">
         {/* TAB 1: Grafic + Heatmap Overlay */}
         <div
-          className={`flex-1 relative border-r border-gray-800 h-full ${
+          className={`min-w-0 flex-1 relative border-r border-gray-800 h-full ${
             activeTab === 'chart' ? 'block' : 'hidden md:block'
           }`}
         >
@@ -1207,7 +1443,7 @@ export default function DeepLiquidityHeatmapChart() {
             </div>
           )}
 
-          <div ref={chartContainerRef} className="w-full h-full relative" />
+          <div ref={chartContainerRef} className="relative h-full w-full min-w-0" />
           <canvas
             ref={chartCanvasOverlayRef}
             className="absolute top-0 left-0 pointer-events-none z-10"
@@ -1216,10 +1452,21 @@ export default function DeepLiquidityHeatmapChart() {
 
         {/* TAB 2: DOM / Order Book */}
         <div
-          className={`w-full md:w-80 bg-[#11141c] flex flex-col font-mono text-xs select-none relative h-full ${
+          style={{ '--dom-panel-width': `${domPanelWidth}px` }}
+          className={`w-full md:w-[var(--dom-panel-width)] md:min-w-[var(--dom-panel-width)] md:flex-none md:shrink-0 bg-[#11141c] flex flex-col font-mono text-xs select-none relative h-full ${
             activeTab === 'dom' ? 'flex' : 'hidden md:flex'
           }`}
         >
+          <div
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize DOM panel"
+            tabIndex={0}
+            onPointerDown={beginPanelResize}
+            className="absolute -left-1.5 top-0 z-50 hidden h-full w-3 cursor-col-resize touch-none items-center justify-center md:flex"
+          >
+            <span className="h-12 w-1 rounded-full bg-gray-500/60 transition-colors hover:bg-blue-400" />
+          </div>
           <div className="px-3 py-2 bg-[#171c28] border-b border-gray-800 flex justify-between items-center text-gray-400 text-[11px]">
             <span>Pas Preț (%):</span>
             <div className="flex items-center gap-1">
@@ -1235,22 +1482,37 @@ export default function DeepLiquidityHeatmapChart() {
             </div>
           </div>
 
-          <div className="grid grid-cols-2 bg-[#181d2a] border-b border-gray-800 text-[10px] text-gray-400 py-1.5 px-3 font-bold">
-            <span className="text-left">VOLUM ($)</span>
-            <span className="text-right">PREȚ</span>
+          <div
+            ref={domColumnHeaderRef}
+            style={{ gridTemplateColumns: domGridTemplateColumns }}
+            className="grid bg-[#181d2a] border-b border-gray-800 text-[9px] md:text-[10px] text-gray-400 py-1.5 px-2 font-bold"
+          >
+            {['CLUSTER', 'TRADE FEED', 'VOL ($)', 'PRICE LEVEL'].map((title, index) => (
+              <span
+                key={title}
+                className={`relative flex min-w-0 items-center whitespace-nowrap ${
+                  index === 0 ? 'justify-start' : index === 1 ? 'justify-center' : 'justify-end'
+                }`}
+              >
+                {index === 0 ? (
+                  <span className="flex min-w-0 items-center gap-1">
+                    <span>{title}</span>
+                    <span className="text-[8px] font-medium text-blue-300">{clusterWindowEnd}</span>
+                  </span>
+                ) : title}
+                {index < 3 && (
+                  <span
+                    role="separator"
+                    aria-orientation="vertical"
+                    aria-label={`Resize ${title} column`}
+                    tabIndex={0}
+                    onPointerDown={(event) => beginColumnResize(index, event)}
+                    className="absolute -right-1 top-[-6px] bottom-[-6px] z-40 w-2 cursor-col-resize touch-none hover:bg-blue-400/60"
+                  />
+                )}
+              </span>
+            ))}
           </div>
-
-          {!autoCenter && (
-            <button
-              onClick={() => {
-                setAutoCenter(true);
-                centerDom();
-              }}
-              className="absolute bottom-4 left-1/2 -translate-x-1/2 bg-blue-600 hover:bg-blue-500 text-white text-[10px] px-3 py-1.5 rounded-full shadow-lg z-30 font-bold"
-            >
-              Centrare
-            </button>
-          )}
 
           <div
             ref={domContainerRef}
@@ -1306,12 +1568,61 @@ export default function DeepLiquidityHeatmapChart() {
                       left: 0,
                       right: 0,
                       height: `${ROW_HEIGHT}px`,
+                      gridTemplateColumns: domGridTemplateColumns,
                     }}
-                    className={`grid grid-cols-2 items-center px-3 border-b border-gray-900/60 cursor-pointer hover:brightness-125 ${rowBgStyle}`}
+                    className={`grid items-center gap-1 px-2 border-b border-gray-900/60 cursor-pointer hover:brightness-125 ${rowBgStyle}`}
                   >
+                    <div className="relative h-4 min-w-0 flex items-center overflow-hidden rounded bg-gray-950/90">
+                      {(() => {
+                        const cluster = tradesByLevel.get(row.index);
+                        if (!cluster) return null;
+                        const total = cluster.buyVolume + cluster.sellVolume;
+                        if (total <= 0) return null;
+                        const buyWidth = (cluster.buyVolume / total) * 100;
+
+                        return (
+                          <>
+                            <div className="absolute inset-y-0 left-0 bg-green-500/80" style={{ width: `${buyWidth}%` }} />
+                            <div className="absolute inset-y-0 right-0 bg-red-500/80" style={{ width: `${100 - buyWidth}%` }} />
+                            <span
+                              className="relative z-10 w-full truncate text-center text-[9px] font-extrabold leading-none text-white [text-shadow:0_1px_2px_#000]"
+                              title={`Buy ${formatDollarVolume(cluster.buyVolume)} / Sell ${formatDollarVolume(cluster.sellVolume)}`}
+                            >
+                              {formatDollarVolume(total)}
+                            </span>
+                          </>
+                        );
+                      })()}
+                    </div>
+
+                    <div className="relative h-full min-w-0">
+                      <div
+                        className="relative z-30 flex h-full min-w-0 flex-row-reverse flex-nowrap items-center justify-start gap-0.5 overflow-hidden whitespace-nowrap"
+                        aria-label="Recent trades at this price level"
+                      >
+                        {(tradesByLevel.get(row.index)?.trades ?? []).map((trade) => (
+                          <span
+                            key={trade.id}
+                            className={`flex h-5 shrink-0 items-center justify-center border text-[9px] font-extrabold leading-none text-white ${
+                              trade.dollarVal >= LARGE_TRADE_THRESHOLD_USD
+                                ? 'min-w-max rounded-none px-1.5'
+                                : 'min-w-4 rounded-full px-1 text-[7px]'
+                            } ${
+                              trade.isBuy
+                                ? 'border-green-300/70 bg-green-600'
+                                : 'border-red-300/70 bg-red-600'
+                            }`}
+                            title={`${trade.isBuy ? 'Buy' : 'Sell'} ${formatDollarVolume(trade.dollarVal)} @ ${trade.price} (${trade.time})`}
+                          >
+                            {trade.dollarVal >= LARGE_TRADE_THRESHOLD_USD ? formatDollarVolume(trade.dollarVal) : ''}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
                     <div className="relative h-full flex items-center justify-start overflow-hidden">
                       <div
-                        className={`absolute left-0 top-0 bottom-0 pointer-events-none opacity-30 ${
+                        className={`absolute left-0 top-0 bottom-0 pointer-events-none opacity-15 ${
                           isAsk ? 'bg-red-500' : 'bg-green-500'
                         }`}
                         style={{ width: barWidth }}
@@ -1325,7 +1636,7 @@ export default function DeepLiquidityHeatmapChart() {
                       </span>
                     </div>
 
-                    <div className="text-right h-full flex items-center justify-end">
+                    <div className="text-right h-full min-w-0 flex items-center justify-end overflow-hidden">
                       <span className={`text-[11px] ${priceTextColor}`}>
                         {isHovered ? (
                           <span className="text-yellow-300 font-bold">
@@ -1339,6 +1650,22 @@ export default function DeepLiquidityHeatmapChart() {
                   </div>
                 );
               })}
+              {largeOrderBands.map((band) => (
+                <div
+                  key={`large-order-${band.id}`}
+                  style={{ gridTemplateColumns: domGridTemplateColumns, top: `${band.start * ROW_HEIGHT}px`, height: `${(band.end - band.start + 1) * ROW_HEIGHT}px` }}
+                  className="pointer-events-none absolute left-0 right-0 z-20 grid gap-1 px-2"
+                  title={`Large ${band.isBuy ? 'buy' : 'sell'} trade from current price to trade price`}
+                >
+                  <div
+                    className={`col-start-2 h-full rounded-sm border-2 ${
+                      band.isBuy
+                        ? 'border-green-400/80 bg-green-500/10'
+                        : 'border-red-400/80 bg-red-500/10'
+                    }`}
+                  />
+                </div>
+              ))}
             </div>
           </div>
         </div>
