@@ -10,6 +10,15 @@ const TIMEFRAMES = [
   { label: '1d', value: '1d' },
 ];
 
+const TIMEFRAME_SECONDS = {
+  '1m': 60,
+  '5m': 5 * 60,
+  '15m': 15 * 60,
+  '1h': 60 * 60,
+  '4h': 4 * 60 * 60,
+  '1d': 24 * 60 * 60,
+};
+
 const ROW_HEIGHT = 20;
 const VISIBLE_BUFFER = 10;
 const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
@@ -207,6 +216,8 @@ export default function DeepLiquidityHeatmapChart() {
   const chartInstanceRef = useRef(null);
   const candlestickSeriesRef = useRef(null);
   const volumeSeriesRef = useRef(null);
+  const rulerRef = useRef(null);
+  const rulerPhaseRef = useRef('idle');
   const priceLoadedForSymbolRef = useRef(null);
   const initialCenterKeyRef = useRef(null);
   const currentCandleRef = useRef(null);
@@ -443,6 +454,8 @@ export default function DeepLiquidityHeatmapChart() {
     });
     setHoveredPrice(null);
     setScrollTop(0);
+    rulerRef.current = null;
+    rulerPhaseRef.current = 'idle';
 
     currentPriceRef.current = null;
     currentCandleRef.current = null;
@@ -685,71 +698,133 @@ export default function DeepLiquidityHeatmapChart() {
 
     ctx.clearRect(0, 0, width, height);
 
-    if (!showLiquidity) return;
+    if (showLiquidity) {
+      const activeLevels = activeLiquidityRef.current;
+      const values = Object.values(activeLevels);
 
-    const activeLevels = activeLiquidityRef.current;
-    const values = Object.values(activeLevels);
-
-    const maxVal = Math.max(...values, minLiquidityUsd * 2, 1);
-    const bandHeight = Math.max(
-      4,
-      Math.min(14, 1500 / (chart.timeScale().width() || 500))
-    );
-
-    // 1. Desenare Lichiditate Activă (Heatmap)
-    Object.entries(activeLevels).forEach(([pStr, valUSD]) => {
-      const price = parseFloat(pStr);
-      const yCoord = series.priceToCoordinate(price);
-
-      if (yCoord === null || yCoord < 0 || yCoord > height) return;
-
-      const intensity = Math.min(
-        1,
-        Math.max(
-          0.1,
-          (valUSD - minLiquidityUsd) /
-            (maxVal - minLiquidityUsd || 1)
-        )
+      const maxVal = Math.max(...values, minLiquidityUsd * 2, 1);
+      const bandHeight = Math.max(
+        4,
+        Math.min(14, 1500 / (chart.timeScale().width() || 500))
       );
 
-      const r = Math.round(255 + (220 - 255) * intensity);
-      const g = Math.round(140 * (1 - intensity));
-      const b = Math.round(38 * intensity);
-      const alpha = 0.1 + intensity * 0.25;
+      Object.entries(activeLevels).forEach(([pStr, valUSD]) => {
+        const price = parseFloat(pStr);
+        const yCoord = series.priceToCoordinate(price);
 
-      ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
-      ctx.fillRect(0, yCoord - bandHeight / 2, width, bandHeight);
-    });
-
-    // 2. Desenare Animații / Evidențieri Liquidity Sweep (Recent Măturate)
-    if (showSweeps && sweptLiquidityRef.current.length > 0) {
-      const now = Date.now();
-      sweptLiquidityRef.current.forEach((sweep) => {
-        const elapsed = now - sweep.timestamp;
-        if (elapsed > 15000) return; // Expirează după 15s
-
-        const yCoord = series.priceToCoordinate(sweep.price);
         if (yCoord === null || yCoord < 0 || yCoord > height) return;
 
-        // Animație de fading out
-        const fadeRatio = 1 - elapsed / 15000;
+        const intensity = Math.min(
+          1,
+          Math.max(
+            0.1,
+            (valUSD - minLiquidityUsd) /
+              (maxVal - minLiquidityUsd || 1)
+          )
+        );
 
-        // Linie punctată vibrantă pe nivelul măturat
-        ctx.save();
-        ctx.strokeStyle = sweep.type === 'BUY_SWEEP'
-          ? `rgba(245, 158, 11, ${fadeRatio})`
-          : `rgba(59, 130, 246, ${fadeRatio})`;
-        ctx.lineWidth = 2;
-        ctx.setLineDash([6, 4]);
+        const r = Math.round(255 + (220 - 255) * intensity);
+        const g = Math.round(140 * (1 - intensity));
+        const b = Math.round(38 * intensity);
+        const alpha = 0.1 + intensity * 0.25;
 
-        ctx.beginPath();
-        ctx.moveTo(0, yCoord);
-        ctx.lineTo(width, yCoord);
-        ctx.stroke();
-        ctx.restore();
+        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+        ctx.fillRect(0, yCoord - bandHeight / 2, width, bandHeight);
       });
+
+      if (showSweeps && sweptLiquidityRef.current.length > 0) {
+        const now = Date.now();
+        sweptLiquidityRef.current.forEach((sweep) => {
+          const elapsed = now - sweep.timestamp;
+          if (elapsed > 15000) return;
+
+          const yCoord = series.priceToCoordinate(sweep.price);
+          if (yCoord === null || yCoord < 0 || yCoord > height) return;
+
+          const fadeRatio = 1 - elapsed / 15000;
+
+          ctx.save();
+          ctx.strokeStyle = sweep.type === 'BUY_SWEEP'
+            ? `rgba(245, 158, 11, ${fadeRatio})`
+            : `rgba(59, 130, 246, ${fadeRatio})`;
+          ctx.lineWidth = 2;
+          ctx.setLineDash([6, 4]);
+          ctx.beginPath();
+          ctx.moveTo(0, yCoord);
+          ctx.lineTo(width, yCoord);
+          ctx.stroke();
+          ctx.restore();
+        });
+      }
     }
-  }, [showLiquidity, showSweeps, minLiquidityUsd]);
+
+    const ruler = rulerRef.current;
+    if (!ruler) return;
+
+    const startX = chart.timeScale().logicalToCoordinate(ruler.start.logical);
+    const endX = chart.timeScale().logicalToCoordinate(ruler.end.logical);
+    const startY = series.priceToCoordinate(ruler.start.price);
+    const endY = series.priceToCoordinate(ruler.end.price);
+    if (startX === null || endX === null || startY === null || endY === null) return;
+
+    const delta = ruler.end.price - ruler.start.price;
+    const percent = ruler.start.price
+      ? (delta / ruler.start.price) * 100
+      : 0;
+    const barCount = Math.max(1, Math.round(Math.abs(ruler.end.logical - ruler.start.logical)) + 1);
+    const durationSeconds = Math.round(
+      Math.abs(ruler.end.logical - ruler.start.logical) * TIMEFRAME_SECONDS[timeframe]
+    );
+    const durationLabel = durationSeconds >= 86400
+      ? `${(durationSeconds / 86400).toFixed(1)}d`
+      : durationSeconds >= 3600
+        ? `${(durationSeconds / 3600).toFixed(1)}h`
+        : durationSeconds >= 60
+          ? `${Math.round(durationSeconds / 60)}m`
+          : `${durationSeconds}s`;
+    const priceLabel = `${delta > 0 ? '+' : ''}${delta.toFixed(precision)} (${percent > 0 ? '+' : ''}${percent.toFixed(2)}%)`;
+    const rangeLabel = `${barCount} ${barCount === 1 ? 'bar' : 'bars'} · ${durationLabel}`;
+    const left = Math.min(startX, endX);
+    const right = Math.max(startX, endX);
+    const top = Math.min(startY, endY);
+    const bottom = Math.max(startY, endY);
+    const color = delta >= 0 ? '#26a69a' : '#ef5350';
+    const labelWidth = 174;
+    const labelHeight = 42;
+    const labelX = Math.min(width - labelWidth - 4, Math.max(4, left));
+    const labelY = top - labelHeight - 6 >= 4
+      ? top - labelHeight - 6
+      : Math.min(height - labelHeight - 4, bottom + 6);
+
+    ctx.save();
+    ctx.fillStyle = delta >= 0 ? 'rgba(38, 166, 154, 0.16)' : 'rgba(239, 83, 80, 0.16)';
+    ctx.fillRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top));
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.rect(left, top, right - left, bottom - top);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(startX, startY);
+    ctx.lineTo(endX, endY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    [ [startX, startY], [endX, endY] ].forEach(([x, y]) => {
+      ctx.beginPath();
+      ctx.arc(x, y, 3, 0, Math.PI * 2);
+      ctx.fill();
+    });
+    ctx.fillStyle = color;
+    ctx.fillRect(labelX, labelY, labelWidth, labelHeight);
+    ctx.font = 'bold 12px monospace';
+    ctx.fillStyle = '#fff';
+    ctx.fillText(priceLabel, labelX + 8, labelY + 16);
+    ctx.font = '11px monospace';
+    ctx.fillText(rangeLabel, labelX + 8, labelY + 33);
+    ctx.restore();
+  }, [showLiquidity, showSweeps, minLiquidityUsd, precision, timeframe]);
 
   // Versiunea curentă a funcției de desenare, disponibilă pentru callback-urile asincrone
   drawRef.current = drawLiquidityMap;
@@ -829,6 +904,66 @@ export default function DeepLiquidityHeatmapChart() {
       requestAnimationFrame(drawLiquidityMap);
     });
 
+    const getRulerPoint = (event) => {
+      const bounds = chartContainerRef.current.getBoundingClientRect();
+      const x = event.clientX - bounds.left;
+      const y = event.clientY - bounds.top;
+      const logical = chart.timeScale().coordinateToLogical(x);
+      const price = candleSeries.coordinateToPrice(y);
+
+      if (logical === null || price === null) return null;
+      return { logical, price };
+    };
+
+    const handleRulerPointerDown = (event) => {
+      if (event.button !== 0) return;
+
+      const phase = rulerPhaseRef.current;
+      if (phase === 'idle' && !event.shiftKey) return;
+
+      const point = getRulerPoint(event);
+      if (!point) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      if (phase === 'idle') {
+        rulerRef.current = { start: point, end: point };
+        rulerPhaseRef.current = 'placing-end';
+      } else if (phase === 'placing-end') {
+        rulerRef.current = { ...rulerRef.current, end: point };
+        rulerPhaseRef.current = 'placed';
+      } else {
+        rulerRef.current = null;
+        rulerPhaseRef.current = 'idle';
+      }
+
+      requestAnimationFrame(drawRef.current);
+    };
+
+    const handleRulerPointerMove = (event) => {
+      if (rulerPhaseRef.current !== 'placing-end') return;
+
+      const point = getRulerPoint(event);
+      if (!point) return;
+
+      rulerRef.current = { ...rulerRef.current, end: point };
+      requestAnimationFrame(drawRef.current);
+    };
+
+    const handleRulerKeyDown = (event) => {
+      if (event.key !== 'Escape' || !rulerRef.current) return;
+
+      rulerRef.current = null;
+      rulerPhaseRef.current = 'idle';
+      requestAnimationFrame(drawRef.current);
+    };
+
+    const chartContainer = chartContainerRef.current;
+    chartContainer.addEventListener('pointerdown', handleRulerPointerDown, true);
+    chartContainer.addEventListener('pointermove', handleRulerPointerMove, true);
+    window.addEventListener('keydown', handleRulerKeyDown);
+
     const handleResize = () => {
       if (chartContainerRef.current) {
         chart.applyOptions({
@@ -845,6 +980,11 @@ export default function DeepLiquidityHeatmapChart() {
 
     return () => {
       resizeObserver.disconnect();
+      chartContainer.removeEventListener('pointerdown', handleRulerPointerDown, true);
+      chartContainer.removeEventListener('pointermove', handleRulerPointerMove, true);
+      window.removeEventListener('keydown', handleRulerKeyDown);
+      rulerRef.current = null;
+      rulerPhaseRef.current = 'idle';
       chart.remove();
       chartInstanceRef.current = null;
       candlestickSeriesRef.current = null;
@@ -1067,6 +1207,26 @@ export default function DeepLiquidityHeatmapChart() {
 
     return max || 1;
   }, [orderBook]);
+
+  const hoveredCumulativeVolume = useMemo(() => {
+    if (hoveredPrice === null) return null;
+
+    const price = parseFloat(hoveredPrice);
+    const askAtLevel = Object.entries(orderBook.asks).some(([priceString, volume]) => {
+      const levelPrice = parseFloat(priceString);
+      return levelPrice >= price && levelPrice < price + tickStep && volume > 0;
+    });
+    const isAsk = askAtLevel || (currentPrice !== null && price > currentPrice);
+    const levels = isAsk ? orderBook.asks : orderBook.bids;
+
+    return Object.entries(levels).reduce((total, [priceString, volume]) => {
+      const levelPrice = parseFloat(priceString);
+      const isThroughLevel = isAsk
+        ? levelPrice < price + tickStep
+        : levelPrice > price - tickStep;
+      return isThroughLevel ? total + levelPrice * volume : total;
+    }, 0);
+  }, [hoveredPrice, orderBook, currentPrice, tickStep]);
 
   const priceLevels = useMemo(() => {
     if (!fixedAnchorPrice || fixedAnchorPrice <= 0 || tickStep <= 0) {
@@ -1576,6 +1736,9 @@ export default function DeepLiquidityHeatmapChart() {
           <div className="absolute top-2 left-2 z-20 text-sm md:text-xl font-bold text-gray-400 opacity-40 pointer-events-none select-none">
             {symbol} • {timeframe}
           </div>
+          <div className="absolute top-2 right-2 z-20 rounded bg-[#121620]/80 px-2 py-1 text-[10px] text-gray-400 pointer-events-none">
+            Shift + click: start · Click: set end · Click: remove
+          </div>
 
           {showLiquidity && (
             <div className="absolute bottom-2 left-2 z-20 flex items-center gap-2 bg-[#121620]/80 backdrop-blur px-2 py-1 rounded border border-gray-800 text-[9px] md:text-[10px] text-gray-300">
@@ -1774,8 +1937,13 @@ export default function DeepLiquidityHeatmapChart() {
                         className={`text-[11px] font-semibold z-10 relative ${
                           isAsk ? 'text-red-300' : 'text-green-300'
                         }`}
+                        title={isHovered
+                          ? `Cumulative ${isAsk ? 'ask' : 'bid'} volume through ${row.price}: ${formatCompactCurrency(hoveredCumulativeVolume)}`
+                          : `Volume at level: ${formatDollarVolume(dollarVal) || '$0'}`}
                       >
-                        {formatDollarVolume(dollarVal)}
+                        {isHovered
+                          ? formatCompactCurrency(hoveredCumulativeVolume)
+                          : formatDollarVolume(dollarVal)}
                       </span>
                     </div>
 
