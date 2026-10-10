@@ -24,10 +24,243 @@ const VISIBLE_BUFFER = 10;
 const TRADE_FEED_DISPLAY_COUNT = 8;
 const DOM_COLUMN_MIN_WIDTHS = [48, 48, 80, 96];
 const CLUSTER_WINDOW_MS = 5 * 60 * 1000;
-const LIQUIDITY_SWEEP_DISPLAY_MS = 15 * 1000;
 const DEFAULT_LARGE_TRADE_THRESHOLD_USD = 1000;
+const LIQUIDATION_MAINTENANCE_MARGIN_RATE = 0.005;
+const LIQUIDATION_BIN_WIDTH_PERCENT = 0.001;
+const LIQUIDATION_VISIBLE_WINDOW_MS = 12 * 60 * 60 * 1000;
+const LIQUIDATION_ATR_PERIOD = 14;
+const LIQUIDATION_LEVERAGE_WEIGHTS = [
+  [5, 0.1],
+  [10, 0.2],
+  [25, 0.3],
+  [50, 0.25],
+  [100, 0.15],
+];
+const OPEN_INTEREST_PERIODS = {
+  '1m': '5m',
+  '5m': '5m',
+  '15m': '15m',
+  '1h': '1h',
+  '4h': '4h',
+  '1d': '1d',
+};
+const OPEN_INTEREST_PERIOD_MS = {
+  '5m': 5 * 60 * 1000,
+  '15m': 15 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '4h': 4 * 60 * 60 * 1000,
+  '1d': 24 * 60 * 60 * 1000,
+};
+const LIQUIDATION_LEVEL_LIMIT = 12;
 const getClusterWindowStart = (timestamp) =>
   Math.floor(timestamp / CLUSTER_WINDOW_MS) * CLUSTER_WINDOW_MS;
+
+const getQuantile = (sortedValues, quantile) => {
+  if (sortedValues.length === 0) return 0;
+  const index = (sortedValues.length - 1) * quantile;
+  const lowerIndex = Math.floor(index);
+  const upperIndex = Math.ceil(index);
+  const fraction = index - lowerIndex;
+
+  return sortedValues[lowerIndex] +
+    (sortedValues[upperIndex] - sortedValues[lowerIndex]) * fraction;
+};
+
+const getLiquidationHeatColor = (value, minValue, maxValue) => {
+  const minimum = Math.max(minValue, 1);
+  const maximum = Math.max(maxValue, minimum * 1.01);
+  const intensity = Math.min(
+    1,
+    Math.max(0, Math.log(Math.max(value, minimum) / minimum) / Math.log(maximum / minimum))
+  );
+  const colorStops = [
+    [21, 14, 49],
+    [37, 31, 94],
+    [42, 55, 137],
+    [34, 99, 166],
+    [24, 147, 173],
+    [25, 160, 120],
+    [142, 190, 76],
+    [238, 202, 77],
+  ];
+  const stopPosition = intensity * (colorStops.length - 1);
+  const lowerStop = Math.floor(stopPosition);
+  const upperStop = Math.min(colorStops.length - 1, lowerStop + 1);
+  const blend = stopPosition - lowerStop;
+  const [red, green, blue] = colorStops[lowerStop].map((channel, index) => (
+    Math.round(channel + (colorStops[upperStop][index] - channel) * blend)
+  ));
+  const alpha = 0.055 + intensity ** 1.8 * 0.42;
+
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+};
+
+const calculateLiquidationHeatmap = (
+  klineData,
+  openInterestData,
+  openInterestPeriod,
+  liveOpenInterestUsd
+) => {
+  const periodMs = OPEN_INTEREST_PERIOD_MS[openInterestPeriod];
+  const modelCandles = new Map();
+
+  klineData.forEach((row) => {
+    const openTime = Number(row[0]);
+    const bucketTime = Math.floor(openTime / periodMs) * periodMs;
+    const candle = modelCandles.get(bucketTime);
+    const open = Number(row[1]);
+    const high = Number(row[2]);
+    const low = Number(row[3]);
+    const close = Number(row[4]);
+
+    if (candle) {
+      candle.high = Math.max(candle.high, high);
+      candle.low = Math.min(candle.low, low);
+      candle.close = close;
+    } else {
+      modelCandles.set(bucketTime, {
+        time: bucketTime / 1000,
+        open,
+        high,
+        low,
+        close,
+      });
+    }
+  });
+
+  const candles = Array.from(modelCandles.values()).sort((a, b) => a.time - b.time);
+  if (candles.length === 0) return [];
+
+  const candleByTime = new Map(candles.map((candle) => [candle.time * 1000, candle]));
+  let previousOpenInterest = null;
+
+  const sortedOpenInterest = openInterestData
+    .map((row) => ({
+      timestamp: Number(row.timestamp),
+      value: Number(row.sumOpenInterestValue),
+    }))
+    .filter((row) => Number.isFinite(row.timestamp) && Number.isFinite(row.value))
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  sortedOpenInterest.forEach((sample) => {
+    const bucketTime = Math.floor(sample.timestamp / periodMs) * periodMs;
+    const candle = candleByTime.get(bucketTime);
+
+    if (candle && previousOpenInterest !== null) {
+      candle.newOpenInterest = Math.max(0, sample.value - previousOpenInterest);
+    }
+    previousOpenInterest = sample.value;
+  });
+
+  const latestCandle = candles[candles.length - 1];
+  const latestOpenInterest = sortedOpenInterest[sortedOpenInterest.length - 1];
+  if (
+    latestCandle &&
+    latestOpenInterest &&
+    Number.isFinite(liveOpenInterestUsd) &&
+    liveOpenInterestUsd > 0 &&
+    Math.abs(
+      Math.floor(latestCandle.time * 1000 / periodMs) -
+      Math.floor(latestOpenInterest.timestamp / periodMs)
+    ) <= 1
+  ) {
+    latestCandle.newOpenInterest = Math.max(
+      latestCandle.newOpenInterest || 0,
+      liveOpenInterestUsd - latestOpenInterest.value
+    );
+  }
+
+  const latestCandleIndex = candles.length - 1;
+  const referencePrice = candles[latestCandleIndex].close;
+  const binSize = Math.max(referencePrice * LIQUIDATION_BIN_WIDTH_PERCENT, 1e-8);
+  const atrCandles = klineData
+    .map((row) => ({
+      time: Number(row[0]),
+      high: Number(row[2]),
+      low: Number(row[3]),
+      close: Number(row[4]),
+    }))
+    .filter((candle) => (
+      Number.isFinite(candle.time) &&
+      Number.isFinite(candle.high) &&
+      Number.isFinite(candle.low) &&
+      Number.isFinite(candle.close)
+    ))
+    .sort((left, right) => left.time - right.time);
+  const trueRanges = atrCandles.map((candle, index) => {
+    const previousClose = atrCandles[index - 1]?.close ?? candle.close;
+    return Math.max(
+      candle.high - candle.low,
+      Math.abs(candle.high - previousClose),
+      Math.abs(candle.low - previousClose)
+    );
+  });
+  const atr = trueRanges
+    .slice(Math.max(0, trueRanges.length - LIQUIDATION_ATR_PERIOD))
+    .reduce((total, range) => total + range, 0) /
+    Math.min(trueRanges.length, LIQUIDATION_ATR_PERIOD);
+  const openInterestUsd = liveOpenInterestUsd > 0
+    ? liveOpenInterestUsd
+    : latestOpenInterest?.value ?? 0;
+  const positions = [];
+  const columns = [];
+
+  candles.forEach((candle, index) => {
+    for (let positionIndex = positions.length - 1; positionIndex >= 0; positionIndex -= 1) {
+      const position = positions[positionIndex];
+      if (position.startIndex === index) continue;
+      const wasLiquidated = position.side === 'long'
+        ? candle.low <= position.price
+        : candle.high >= position.price;
+      if (wasLiquidated) positions.splice(positionIndex, 1);
+    }
+
+    const newOpenInterest = candle.newOpenInterest || 0;
+    if (newOpenInterest > 0) {
+      const entryPrice = (candle.high + candle.low + candle.close) / 3;
+      const longShare = candle.close >= candle.open ? 0.6 : 0.4;
+
+      LIQUIDATION_LEVERAGE_WEIGHTS.forEach(([leverage, weight]) => {
+        const notional = newOpenInterest * weight;
+        positions.push({
+          price: entryPrice * (1 - 1 / leverage + LIQUIDATION_MAINTENANCE_MARGIN_RATE),
+          side: 'long',
+          notional: notional * longShare,
+          startIndex: index,
+        });
+        positions.push({
+          price: entryPrice * (1 + 1 / leverage - LIQUIDATION_MAINTENANCE_MARGIN_RATE),
+          side: 'short',
+          notional: notional * (1 - longShare),
+          startIndex: index,
+        });
+      });
+    }
+
+    const bins = new Map();
+    positions.forEach((position) => {
+      const price = Math.round(position.price / binSize) * binSize;
+      const key = price.toString();
+      const bin = bins.get(key) || { price, longUsd: 0, shortUsd: 0 };
+      if (position.side === 'long') {
+        bin.longUsd += position.notional;
+      } else {
+        bin.shortUsd += position.notional;
+      }
+      bins.set(key, bin);
+    });
+    columns.push({
+      time: candle.time,
+      bins: Array.from(bins.values()),
+    });
+  });
+
+  return columns.map((column, index) => ({
+    ...column,
+    binSize,
+    ...(index === latestCandleIndex ? { atr, openInterestUsd } : {}),
+  }));
+};
 
 const getTradeLevelPosition = (price, isBuy, basePrice, tickStep, basePosition) => {
   if (basePrice === undefined || tickStep <= 0 || basePosition < 0) return -1;
@@ -48,6 +281,7 @@ const getTradeLevelPosition = (price, isBuy, basePrice, tickStep, basePosition) 
 // WebSocket-ul este împărțit pe rute: /public (order book) și /market (kline, ticker, trade).
 // URL-urile vechi (wss://fstream.binance.com/stream) au fost scoase din funcțiune pe 2026-04-23.
 const FUTURES_REST = 'https://fapi.binance.com/fapi/v1';
+const FUTURES_DATA = 'https://fapi.binance.com/futures/data';
 const FUTURES_WS_PUBLIC = 'wss://fstream.binance.com/public/stream';
 const FUTURES_WS_MARKET = 'wss://fstream.binance.com/market/stream';
 
@@ -155,13 +389,10 @@ export default function DeepLiquidityHeatmapChart() {
     () => localStorage.getItem('hv_dom_auto_center') !== 'false'
   );
 
-  // Stări pentru comutarea vizibilității și pragul de lichiditate minimă
+  // Heatmap visibility and modeled liquidation levels
   const [showLiquidity, setShowLiquidity] = useState(true);
-  const [showSweeps, setShowSweeps] = useState(true);
-  const [minLiquidityUsd, setMinLiquidityUsd] = useState(() =>
-    getStoredNumber('hv_min_liquidity_usd', 10000, (value) => value >= 0)
-  );
-  const [minLiquidityInput, setMinLiquidityInput] = useState(() => minLiquidityUsd.toString());
+  const [liquidationHeatmap, setLiquidationHeatmap] = useState([]);
+  const [liquidationModelStatus, setLiquidationModelStatus] = useState('loading');
 
   const [priceStepPercent, setPriceStepPercent] = useState(() =>
     getStoredNumber('hv_price_step_percent', 0.1, (value) => value > 0)
@@ -180,7 +411,6 @@ export default function DeepLiquidityHeatmapChart() {
   const [fixedAnchorPrice, setFixedAnchorPrice] = useState(null);
 
   const [trades, setTrades] = useState([]);
-  const [sweptLiquidity, setSweptLiquidity] = useState([]);
   const [clusterData, setClusterData] = useState(() => ({
     windowStart: getClusterWindowStart(Date.now()),
     levels: new Map(),
@@ -214,10 +444,6 @@ export default function DeepLiquidityHeatmapChart() {
       centerDomAnimationRef.current = null;
     }
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem('hv_min_liquidity_usd', minLiquidityUsd.toString());
-  }, [minLiquidityUsd]);
 
   useEffect(() => {
     localStorage.setItem('hv_price_step_percent', priceStepPercent.toString());
@@ -269,29 +495,9 @@ export default function DeepLiquidityHeatmapChart() {
   const searchInputRef = useRef(null);
   const pendingTradesRef = useRef([]);
   const pendingClusterUpdatesRef = useRef(new Map());
+  const currentOpenInterestContractsRef = useRef(null);
 
   const localOrderBookRef = useRef({ bids: {}, asks: {} });
-  const activeLiquidityRef = useRef({});
-  const sweptLiquidityRef = useRef([]);
-  const previousLiquidityPriceRef = useRef(null);
-
-  useEffect(() => {
-    if (sweptLiquidity.length === 0) return undefined;
-
-    const nextExpiry = Math.min(
-      ...sweptLiquidity.map((sweep) => sweep.timestamp + LIQUIDITY_SWEEP_DISPLAY_MS)
-    );
-    const timeoutId = setTimeout(() => {
-      const now = Date.now();
-      const remainingSweeps = sweptLiquidityRef.current.filter(
-        (sweep) => now - sweep.timestamp < LIQUIDITY_SWEEP_DISPLAY_MS
-      );
-      sweptLiquidityRef.current = remainingSweeps;
-      setSweptLiquidity(remainingSweeps);
-    }, Math.max(0, nextExpiry - Date.now()));
-
-    return () => clearTimeout(timeoutId);
-  }, [sweptLiquidity]);
 
   useEffect(() => {
     const feedColumn = tradeFeedColumnRef.current;
@@ -323,6 +529,9 @@ export default function DeepLiquidityHeatmapChart() {
         if (data.code) throw new Error(data.msg || 'Binance API error');
         if (!disposed) {
           const openInterest = Number(data.openInterest);
+          currentOpenInterestContractsRef.current = Number.isFinite(openInterest)
+            ? openInterest
+            : null;
           setCoinStats((current) => ({
             ...current,
             openInterest: Number.isFinite(openInterest) ? openInterest : null,
@@ -345,6 +554,73 @@ export default function DeepLiquidityHeatmapChart() {
       clearInterval(intervalId);
     };
   }, [symbol]);
+
+  useEffect(() => {
+    let disposed = false;
+    let requestInFlight = false;
+    const requestedSymbol = symbol.toUpperCase();
+    const openInterestPeriod = OPEN_INTEREST_PERIODS[timeframe];
+
+    const loadLiquidationHeatmap = async () => {
+      if (requestInFlight) return;
+      requestInFlight = true;
+
+      try {
+        const [klineResponse, openInterestResponse] = await Promise.all([
+          fetch(`${FUTURES_REST}/klines?symbol=${requestedSymbol}&interval=${timeframe}&limit=300`),
+          fetch(
+            `${FUTURES_DATA}/openInterestHist?symbol=${requestedSymbol}&period=${openInterestPeriod}&limit=500`
+          ),
+        ]);
+        if (!klineResponse.ok) throw new Error(`Binance klines HTTP ${klineResponse.status}`);
+        if (!openInterestResponse.ok) {
+          throw new Error(`Binance open interest history HTTP ${openInterestResponse.status}`);
+        }
+
+        const [klineData, openInterestData] = await Promise.all([
+          klineResponse.json(),
+          openInterestResponse.json(),
+        ]);
+        if (!Array.isArray(klineData) || !Array.isArray(openInterestData)) {
+          throw new Error('Binance returned invalid liquidation heatmap data');
+        }
+
+        const fallbackPrice = Number(klineData[klineData.length - 1]?.[4]);
+        const livePrice = currentPriceRef.current || fallbackPrice;
+        const liveOpenInterestUsd = currentOpenInterestContractsRef.current * livePrice;
+        const columns = calculateLiquidationHeatmap(
+          klineData,
+          openInterestData,
+          openInterestPeriod,
+          liveOpenInterestUsd
+        );
+        if (disposed) return;
+
+        setLiquidationHeatmap(columns);
+        setLiquidationModelStatus(
+          columns.some((column) => column.bins.length > 0) ? 'ready' : 'unavailable'
+        );
+      } catch (err) {
+        if (!disposed) {
+          console.error('Error loading modeled liquidation heatmap:', err);
+          setLiquidationHeatmap([]);
+          setLiquidationModelStatus('error');
+        }
+      } finally {
+        requestInFlight = false;
+      }
+    };
+
+    setLiquidationHeatmap([]);
+    setLiquidationModelStatus('loading');
+    loadLiquidationHeatmap();
+    const intervalId = setInterval(loadLiquidationHeatmap, 30 * 1000);
+
+    return () => {
+      disposed = true;
+      clearInterval(intervalId);
+    };
+  }, [symbol, timeframe]);
 
   const beginPanelResize = (event) => {
     event.preventDefault();
@@ -425,7 +701,6 @@ export default function DeepLiquidityHeatmapChart() {
 
   // Ref-uri citite de WebSocket / fetch, ca să nu re-creăm conexiunile la fiecare tick de preț
   const currentPriceRef = useRef(null);
-  const syncRef = useRef(null);
   const drawRef = useRef(null);
 
   // Redimensionare redesenare grafic la schimbarea tab-ului
@@ -436,93 +711,10 @@ export default function DeepLiquidityHeatmapChart() {
           width: chartContainerRef.current.clientWidth,
           height: chartContainerRef.current.clientHeight,
         });
-        requestAnimationFrame(drawLiquidityMap);
+        requestAnimationFrame(() => drawRef.current?.());
       }, 50);
     }
   }, [activeTab]);
-
-  // Sincronizare și detectare SWEEP de lichiditate
-  const syncAndFilterLiquidity = useCallback((latestPrice, candleHigh, candleLow) => {
-    const ob = localOrderBookRef.current;
-    const currentActive = {};
-
-    const activeAskLevels = {};
-    Object.entries(ob.asks).forEach(([pStr, vol]) => {
-      const p = parseFloat(pStr);
-      const valUSD = p * vol;
-      if (valUSD >= minLiquidityUsd) {
-        currentActive[p] = valUSD;
-        activeAskLevels[p] = valUSD;
-      }
-    });
-
-    const activeBidLevels = {};
-    Object.entries(ob.bids).forEach(([pStr, vol]) => {
-      const p = parseFloat(pStr);
-      const valUSD = p * vol;
-      if (valUSD >= minLiquidityUsd) {
-        currentActive[p] = valUSD;
-        activeBidLevels[p] = valUSD;
-      }
-    });
-
-    const now = Date.now();
-    const previousSweeps = sweptLiquidityRef.current;
-    const recentSweeps = showSweeps
-      ? previousSweeps.filter(
-        (sweep) => now - sweep.timestamp < LIQUIDITY_SWEEP_DISPLAY_MS
-      )
-      : [];
-    let sweepsChanged = recentSweeps.length !== previousSweeps.length;
-    const previousPrice = previousLiquidityPriceRef.current;
-    const addSweep = (price, value, type) => {
-      const alreadySwept = recentSweeps.some(
-        (sweep) => sweep.price === price && sweep.type === type
-      );
-      if (alreadySwept) return;
-
-      recentSweeps.push({ price, value, timestamp: now, type });
-      sweepsChanged = true;
-    };
-
-    if (
-      showSweeps &&
-      Number.isFinite(latestPrice) &&
-      latestPrice > 0 &&
-      previousPrice !== null
-    ) {
-      Object.keys(activeAskLevels).forEach((priceString) => {
-        const price = Number(priceString);
-        if (previousPrice < price && latestPrice >= price) {
-          addSweep(price, activeAskLevels[priceString], 'BUY_SWEEP');
-        }
-      });
-
-      Object.keys(activeBidLevels).forEach((priceString) => {
-        const price = Number(priceString);
-        if (previousPrice > price && latestPrice <= price) {
-          addSweep(price, activeBidLevels[priceString], 'SELL_SWEEP');
-        }
-      });
-    }
-
-    if (Number.isFinite(latestPrice) && latestPrice > 0) {
-      previousLiquidityPriceRef.current = latestPrice;
-    }
-
-    sweptLiquidityRef.current = recentSweeps;
-    if (sweepsChanged) setSweptLiquidity(recentSweeps);
-
-    if (showSweeps) {
-      recentSweeps.forEach((sweep) => {
-        delete currentActive[sweep.price];
-      });
-    }
-    activeLiquidityRef.current = currentActive;
-  }, [minLiquidityUsd, showSweeps]);
-
-  // Versiunea curentă a funcției, disponibilă pentru WebSocket fără dependențe în efecte
-  syncRef.current = syncAndFilterLiquidity;
 
   // Măsurarea containerului DOM
   useEffect(() => {
@@ -575,11 +767,7 @@ export default function DeepLiquidityHeatmapChart() {
     currentPriceRef.current = null;
     currentCandleRef.current = null;
     localOrderBookRef.current = { bids: {}, asks: {} };
-    activeLiquidityRef.current = {};
-    sweptLiquidityRef.current = [];
-    previousLiquidityPriceRef.current = null;
-    setSweptLiquidity([]);
-
+    currentOpenInterestContractsRef.current = null;
     if (domContainerRef.current) {
       domContainerRef.current.scrollTop = 0;
     }
@@ -695,12 +883,6 @@ export default function DeepLiquidityHeatmapChart() {
       bookDirty = false;
       const ob = localOrderBookRef.current;
       setOrderBook({ bids: { ...ob.bids }, asks: { ...ob.asks } });
-
-      syncRef.current?.(
-        currentPriceRef.current,
-        currentCandleRef.current?.high,
-        currentCandleRef.current?.low
-      );
     };
 
     const bookPublishInterval = setInterval(() => {
@@ -803,7 +985,54 @@ export default function DeepLiquidityHeatmapChart() {
     };
   }, [symbol]);
 
-  // Desenarea hărții de lichiditate și a SWEEPS-urilor pe Canvas
+  const visibleLiquidationColumns = useMemo(() => {
+    const cutoffTime = Date.now() - LIQUIDATION_VISIBLE_WINDOW_MS;
+    return liquidationHeatmap.filter((column) => column.time * 1000 >= cutoffTime);
+  }, [liquidationHeatmap]);
+
+  const strongestLiquidationPriceKeys = useMemo(() => {
+    const latestColumn = visibleLiquidationColumns[visibleLiquidationColumns.length - 1];
+    if (!latestColumn) return new Set();
+
+    const activeLevels = latestColumn.bins
+      .map((bin) => ({
+        key: Math.round(bin.price / latestColumn.binSize),
+        value: bin.longUsd + bin.shortUsd,
+      }))
+      .filter((level) => level.value > 0)
+      .sort((left, right) => right.value - left.value);
+    if (activeLevels.length === 0) return new Set();
+
+    const minimumValue = getQuantile(
+      activeLevels.map((level) => level.value).sort((left, right) => left - right),
+      0.95
+    );
+
+    return new Set(
+      activeLevels
+        .filter((level) => level.value >= minimumValue)
+        .slice(0, LIQUIDATION_LEVEL_LIMIT)
+        .map((level) => level.key)
+    );
+  }, [visibleLiquidationColumns]);
+
+  const liquidationColorScale = useMemo(() => {
+    const values = visibleLiquidationColumns
+      .flatMap((column) => column.bins
+        .filter((bin) => strongestLiquidationPriceKeys.has(
+          Math.round(bin.price / column.binSize)
+        ))
+        .map((bin) => bin.longUsd + bin.shortUsd))
+      .filter((value) => value > 0)
+      .sort((left, right) => left - right);
+
+    return {
+      minValue: Math.max(1, getQuantile(values, 0.5)),
+      maxValue: Math.max(1, getQuantile(values, 0.95)),
+    };
+  }, [visibleLiquidationColumns, strongestLiquidationPriceKeys]);
+
+  // Draw estimated liquidation levels on the chart canvas
   const drawLiquidityMap = useCallback(() => {
     const canvas = chartCanvasOverlayRef.current;
     const chartContainer = chartContainerRef.current;
@@ -826,63 +1055,98 @@ export default function DeepLiquidityHeatmapChart() {
     ctx.clearRect(0, 0, width, height);
 
     if (showLiquidity) {
-      const activeLevels = activeLiquidityRef.current;
-      const values = Object.values(activeLevels);
+      const columns = visibleLiquidationColumns;
+      const plotRight = Math.min(width, chart.timeScale().width());
+      const visiblePriceA = series.coordinateToPrice(0);
+      const visiblePriceB = series.coordinateToPrice(height);
+      const visiblePriceMin = visiblePriceA === null || visiblePriceB === null
+        ? null
+        : Math.min(visiblePriceA, visiblePriceB);
+      const visiblePriceMax = visiblePriceA === null || visiblePriceB === null
+        ? null
+        : Math.max(visiblePriceA, visiblePriceB);
+      const heatColorCache = new Map();
+      const coordinates = columns.map((column) => ({
+        column,
+        x: chart.timeScale().timeToCoordinate(column.time),
+      }));
+      const drawColumnBins = (column, left, right) => {
+        column.bins.forEach((bin) => {
+          const value = bin.longUsd + bin.shortUsd;
+          if (value <= 0) return;
+          if (!strongestLiquidationPriceKeys.has(
+            Math.round(bin.price / column.binSize)
+          )) return;
+          if (
+            visiblePriceMin !== null &&
+            visiblePriceMax !== null &&
+            (
+              bin.price + column.binSize / 2 < visiblePriceMin ||
+              bin.price - column.binSize / 2 > visiblePriceMax
+            )
+          ) return;
 
-      const maxVal = Math.max(...values, minLiquidityUsd * 2, 1);
-      const bandHeight = Math.max(
-        4,
-        Math.min(14, 1500 / (chart.timeScale().width() || 500))
-      );
+          const topY = series.priceToCoordinate(bin.price + column.binSize / 2);
+          const bottomY = series.priceToCoordinate(bin.price - column.binSize / 2);
+          if (topY === null || bottomY === null) return;
 
-      Object.entries(activeLevels).forEach(([pStr, valUSD]) => {
-        const price = parseFloat(pStr);
-        const yCoord = series.priceToCoordinate(price);
+          const bandHeight = Math.max(2, Math.abs(bottomY - topY) * 0.7);
+          let color = heatColorCache.get(value);
+          if (!color) {
+            color = getLiquidationHeatColor(
+              value,
+              liquidationColorScale.minValue,
+              liquidationColorScale.maxValue
+            );
+            heatColorCache.set(value, color);
+          }
+          ctx.fillStyle = color;
+          ctx.fillRect(
+            left,
+            (topY + bottomY) / 2 - bandHeight / 2,
+            Math.max(1, right - left),
+            bandHeight
+          );
+        });
+      };
 
-        if (yCoord === null || yCoord < 0 || yCoord > height) return;
+      coordinates.forEach(({ column, x }, index) => {
+        if (x === null) return;
 
-        const intensity = Math.min(
-          1,
-          Math.max(
-            0.1,
-            (valUSD - minLiquidityUsd) /
-              (maxVal - minLiquidityUsd || 1)
-          )
-        );
+        const previousX = coordinates[index - 1]?.x;
+        const nextX = coordinates[index + 1]?.x;
+        const columnWidth = nextX !== null && nextX !== undefined
+          ? Math.abs(nextX - x)
+          : previousX !== null && previousX !== undefined
+            ? Math.abs(x - previousX)
+            : 4;
+        const left = previousX !== null && previousX !== undefined
+          ? (previousX + x) / 2
+          : x - columnWidth / 2;
+        const right = nextX !== null && nextX !== undefined
+          ? (x + nextX) / 2
+          : x + columnWidth / 2;
+        if (right < 0 || left > plotRight) return;
 
-        const r = Math.round(255 + (220 - 255) * intensity);
-        const g = Math.round(140 * (1 - intensity));
-        const b = Math.round(38 * intensity);
-        const alpha = 0.1 + intensity * 0.25;
-
-        ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
-        ctx.fillRect(0, yCoord - bandHeight / 2, width, bandHeight);
+        drawColumnBins(column, left, right);
       });
 
-      if (showSweeps && sweptLiquidityRef.current.length > 0) {
-        const now = Date.now();
-        sweptLiquidityRef.current.forEach((sweep) => {
-          const elapsed = now - sweep.timestamp;
-          if (elapsed > LIQUIDITY_SWEEP_DISPLAY_MS) return;
-
-          const yCoord = series.priceToCoordinate(sweep.price);
-          if (yCoord === null || yCoord < 0 || yCoord > height) return;
-
-          const fadeRatio = 1 - elapsed / LIQUIDITY_SWEEP_DISPLAY_MS;
-
-          ctx.save();
-          ctx.strokeStyle = sweep.type === 'BUY_SWEEP'
-            ? `rgba(245, 158, 11, ${fadeRatio})`
-            : `rgba(59, 130, 246, ${fadeRatio})`;
-          ctx.lineWidth = 2;
-          ctx.setLineDash([6, 4]);
-          ctx.beginPath();
-          ctx.moveTo(0, yCoord);
-          ctx.lineTo(width, yCoord);
-          ctx.stroke();
-          ctx.restore();
-        });
+      const latestColumnIndex = coordinates.length - 1;
+      const latest = coordinates[latestColumnIndex];
+      const previousX = coordinates[latestColumnIndex - 1]?.x;
+      if (
+        latest?.x !== null &&
+        latest?.x !== undefined &&
+        latest.x <= plotRight
+      ) {
+        const activeRightEdge = previousX !== null && previousX !== undefined
+          ? latest.x + Math.abs(latest.x - previousX) / 2
+          : latest.x;
+        if (activeRightEdge < plotRight) {
+          drawColumnBins(latest.column, Math.max(0, activeRightEdge), plotRight);
+        }
       }
+
     }
 
     const ruler = rulerRef.current;
@@ -951,19 +1215,27 @@ export default function DeepLiquidityHeatmapChart() {
     ctx.font = '11px monospace';
     ctx.fillText(rangeLabel, labelX + 8, labelY + 33);
     ctx.restore();
-  }, [showLiquidity, showSweeps, minLiquidityUsd, precision, timeframe]);
+  }, [
+    showLiquidity,
+    precision,
+    timeframe,
+    visibleLiquidationColumns,
+    strongestLiquidationPriceKeys,
+    liquidationColorScale,
+  ]);
 
   // Versiunea curentă a funcției de desenare, disponibilă pentru callback-urile asincrone
   drawRef.current = drawLiquidityMap;
 
   useEffect(() => {
-    syncAndFilterLiquidity(
-      currentPrice,
-      currentCandleRef.current?.high,
-      currentCandleRef.current?.low
-    );
-    requestAnimationFrame(drawLiquidityMap);
-  }, [orderBook, currentPrice, showLiquidity, minLiquidityUsd, sweptLiquidity, syncAndFilterLiquidity, drawLiquidityMap]);
+    const frameId = requestAnimationFrame(() => drawRef.current?.());
+    return () => cancelAnimationFrame(frameId);
+  }, [
+    currentPrice,
+    showLiquidity,
+    liquidationHeatmap,
+    timeframe,
+  ]);
 
   // Inițializarea graficului
   useEffect(() => {
@@ -977,8 +1249,8 @@ export default function DeepLiquidityHeatmapChart() {
         textColor: '#9CA3AF',
       },
       grid: {
-        vertLines: { color: '#161b26' },
-        horzLines: { color: '#161b26' },
+        vertLines: { visible: false },
+        horzLines: { visible: false },
       },
       crosshair: { mode: 0 },
       localization: {
@@ -1027,9 +1299,19 @@ export default function DeepLiquidityHeatmapChart() {
     candlestickSeriesRef.current = candleSeries;
     volumeSeriesRef.current = volumeSeries;
 
-    chart.timeScale().subscribeVisibleLogicalRangeChange(() => {
-      requestAnimationFrame(drawLiquidityMap);
-    });
+    let overlayRedrawFrame = null;
+    const scheduleOverlayRedraw = () => {
+      if (overlayRedrawFrame !== null) return;
+      overlayRedrawFrame = requestAnimationFrame(() => {
+        overlayRedrawFrame = null;
+        drawRef.current?.();
+      });
+    };
+    const handleChartPointerMove = (event) => {
+      if (event.buttons !== 0) scheduleOverlayRedraw();
+    };
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(scheduleOverlayRedraw);
 
     const getRulerPoint = (event) => {
       const bounds = chartContainerRef.current.getBoundingClientRect();
@@ -1075,7 +1357,7 @@ export default function DeepLiquidityHeatmapChart() {
       if (!point) return;
 
       rulerRef.current = { ...rulerRef.current, end: point };
-      requestAnimationFrame(drawRef.current);
+      scheduleOverlayRedraw();
     };
 
     const handleRulerKeyDown = (event) => {
@@ -1089,6 +1371,8 @@ export default function DeepLiquidityHeatmapChart() {
     const chartContainer = chartContainerRef.current;
     chartContainer.addEventListener('pointerdown', handleRulerPointerDown, true);
     chartContainer.addEventListener('pointermove', handleRulerPointerMove, true);
+    chartContainer.addEventListener('pointermove', handleChartPointerMove);
+    chartContainer.addEventListener('wheel', scheduleOverlayRedraw, { passive: true });
     window.addEventListener('keydown', handleRulerKeyDown);
 
     const handleResize = () => {
@@ -1098,7 +1382,7 @@ export default function DeepLiquidityHeatmapChart() {
           height: chartContainerRef.current.clientHeight,
         });
 
-        requestAnimationFrame(drawLiquidityMap);
+        requestAnimationFrame(() => drawRef.current?.());
       }
     };
 
@@ -1109,7 +1393,10 @@ export default function DeepLiquidityHeatmapChart() {
       resizeObserver.disconnect();
       chartContainer.removeEventListener('pointerdown', handleRulerPointerDown, true);
       chartContainer.removeEventListener('pointermove', handleRulerPointerMove, true);
+      chartContainer.removeEventListener('pointermove', handleChartPointerMove);
+      chartContainer.removeEventListener('wheel', scheduleOverlayRedraw);
       window.removeEventListener('keydown', handleRulerKeyDown);
+      if (overlayRedrawFrame !== null) cancelAnimationFrame(overlayRedrawFrame);
       rulerRef.current = null;
       rulerPhaseRef.current = 'idle';
       chart.remove();
@@ -1117,7 +1404,7 @@ export default function DeepLiquidityHeatmapChart() {
       candlestickSeriesRef.current = null;
       volumeSeriesRef.current = null;
     };
-  }, [drawLiquidityMap]);
+  }, []);
 
   // Încărcarea lumânărilor (Futures)
   useEffect(() => {
@@ -1176,7 +1463,7 @@ export default function DeepLiquidityHeatmapChart() {
         timeScale?.fitContent();
         timeScale?.scrollToRealTime();
 
-        requestAnimationFrame(drawLiquidityMap);
+        requestAnimationFrame(() => drawRef.current?.());
       })
       .catch((err) => {
         if (!cancelled) {
@@ -1187,7 +1474,7 @@ export default function DeepLiquidityHeatmapChart() {
     return () => {
       cancelled = true;
     };
-  }, [symbol, timeframe, drawLiquidityMap]);
+  }, [symbol, timeframe]);
 
   // Actualizări WebSocket Futures pe /market: kline, ticker, aggTrade.
   // Prețul curent și funcția de sync sunt citite din ref-uri, deci conexiunea
@@ -1299,7 +1586,6 @@ export default function DeepLiquidityHeatmapChart() {
                 currentCandleRef.current = updatedCandle;
                 candlestickSeriesRef.current.update(updatedCandle);
 
-                syncRef.current?.(price, updatedCandle.high, updatedCandle.low);
               }
             }
 
@@ -1330,7 +1616,6 @@ export default function DeepLiquidityHeatmapChart() {
               currentPriceRef.current = candle.close;
               setCurrentPrice(candle.close);
 
-              syncRef.current?.(candle.close, candle.high, candle.low);
             }
           } catch (err) {
             console.error('Eroare la procesarea datelor WebSocket:', err);
@@ -1429,43 +1714,48 @@ export default function DeepLiquidityHeatmapChart() {
     return levels;
   }, [fixedAnchorPrice, tickStep, precision]);
 
-  const largestLiquidityLevel = useMemo(() => {
+  const domLiquidationLevels = useMemo(() => {
     const basePosition = priceLevels.findIndex((level) => level.index === 2000);
     const basePrice = priceLevels[basePosition]?.rawPrice;
-    if (basePrice === undefined || tickStep <= 0) return null;
+    if (basePrice === undefined || tickStep <= 0) return [];
 
-    let largestLevel = null;
-    const inspectSide = (bookSide, isAsk) => {
-      Object.entries(bookSide).forEach(([priceString, quantity]) => {
-        const price = Number(priceString);
-        const value = price * quantity;
-        if (
-          !Number.isFinite(price) ||
-          !Number.isFinite(value) ||
-          value <= 0 ||
-          value < minLiquidityUsd ||
-          sweptLiquidity.some((sweep) => sweep.price === price) ||
-          (largestLevel && value <= largestLevel.value)
-        ) return;
+    const latestColumn = visibleLiquidationColumns[visibleLiquidationColumns.length - 1];
+    if (!latestColumn) return [];
 
-        largestLevel = {
-          price,
+    const levelsByPosition = new Map();
+    latestColumn.bins.forEach((bin) => {
+      const value = bin.longUsd + bin.shortUsd;
+      const priceKey = Math.round(bin.price / latestColumn.binSize);
+      if (value <= 0 || !strongestLiquidationPriceKeys.has(priceKey)) return;
+
+      const position = getTradeLevelPosition(
+        bin.price,
+        bin.shortUsd >= bin.longUsd,
+        basePrice,
+        tickStep,
+        basePosition
+      );
+      if (position < 0 || position >= priceLevels.length) return;
+
+      const current = levelsByPosition.get(position);
+      if (current) {
+        current.value += value;
+        current.longUsd += bin.longUsd;
+        current.shortUsd += bin.shortUsd;
+      } else {
+        levelsByPosition.set(position, {
+          price: bin.price,
           value,
-          position: getTradeLevelPosition(
-            price,
-            isAsk,
-            basePrice,
-            tickStep,
-            basePosition
-          ),
-        };
-      });
-    };
+          longUsd: bin.longUsd,
+          shortUsd: bin.shortUsd,
+          position,
+        });
+      }
+    });
 
-    inspectSide(orderBook.asks, true);
-    inspectSide(orderBook.bids, false);
-    return largestLevel;
-  }, [orderBook, minLiquidityUsd, priceLevels, sweptLiquidity, tickStep]);
+    return Array.from(levelsByPosition.values())
+      .sort((left, right) => right.value - left.value);
+  }, [visibleLiquidationColumns, strongestLiquidationPriceKeys, priceLevels, tickStep]);
 
   const currentPriceIndex = useMemo(() => {
     if (!currentPrice || priceLevels.length === 0) return -1;
@@ -1686,28 +1976,6 @@ export default function DeepLiquidityHeatmapChart() {
 
   const visibleTradeStart = Math.max(0, startIndex);
   const visibleTradeEnd = Math.min(priceLevels.length - 1, endIndex);
-  const visibleSweptLiquidity = useMemo(() => {
-    if (!showSweeps) return [];
-
-    const basePosition = priceLevels.findIndex((level) => level.index === 2000);
-    const basePrice = priceLevels[basePosition]?.rawPrice;
-    if (basePrice === undefined || tickStep <= 0) return [];
-
-    return sweptLiquidity
-      .map((sweep) => ({
-        ...sweep,
-        position: getTradeLevelPosition(
-          sweep.price,
-          sweep.type === 'BUY_SWEEP',
-          basePrice,
-          tickStep,
-          basePosition
-        ),
-      }))
-      .filter((sweep) => (
-        sweep.position >= visibleTradeStart && sweep.position <= visibleTradeEnd
-      ));
-  }, [priceLevels, showSweeps, sweptLiquidity, tickStep, visibleTradeEnd, visibleTradeStart]);
   const visibleTradeHeight = Math.max(
     0,
     (visibleTradeEnd - visibleTradeStart + 1) * ROW_HEIGHT
@@ -1717,6 +1985,18 @@ export default function DeepLiquidityHeatmapChart() {
     .filter((trade) => (
       trade.position >= visibleTradeStart && trade.position <= visibleTradeEnd
     ));
+  const visibleDomLiquidationLevels = useMemo(
+    () => domLiquidationLevels
+      .filter((level) => (
+        level.position >= visibleTradeStart && level.position <= visibleTradeEnd
+      ))
+      .slice(0, LIQUIDATION_LEVEL_LIMIT),
+    [domLiquidationLevels, visibleTradeStart, visibleTradeEnd]
+  );
+  const visibleDomLiquidationByPosition = useMemo(
+    () => new Map(visibleDomLiquidationLevels.map((level) => [level.position, level])),
+    [visibleDomLiquidationLevels]
+  );
   const visibleLargeOrderBands = largeOrderBands
     .filter((band) => band.end >= visibleTradeStart && band.start <= visibleTradeEnd)
     .map((band) => ({
@@ -1834,6 +2114,7 @@ export default function DeepLiquidityHeatmapChart() {
       rows.push({
         ...level,
         topOffset: i * ROW_HEIGHT,
+        liquidationLevel: visibleDomLiquidationByPosition.get(i) || null,
         askDollarVolume: levelVolume?.ask ?? 0,
         bidDollarVolume: levelVolume?.bid ?? 0,
         isCurrentLevel: i === currentPriceIndex,
@@ -1851,6 +2132,7 @@ export default function DeepLiquidityHeatmapChart() {
     currentPriceIndex,
     bestAsk,
     bestBid,
+    visibleDomLiquidationByPosition,
   ]);
 
   const applyPercentValue = () => {
@@ -1859,15 +2141,6 @@ export default function DeepLiquidityHeatmapChart() {
       setPriceStepPercent(val);
       setInputValue(val.toString());
       setFixedAnchorPrice(currentPrice);
-    }
-  };
-
-  const applyMinLiquidity = () => {
-    const val = parseFloat(minLiquidityInput);
-    if (!isNaN(val) && val >= 0) {
-      setMinLiquidityUsd(val);
-    } else {
-      setMinLiquidityInput(minLiquidityUsd.toString());
     }
   };
 
@@ -2018,16 +2291,6 @@ export default function DeepLiquidityHeatmapChart() {
               {showLiquidity ? 'Heatmap: ON' : 'Heatmap: OFF'}
             </button>
 
-            {/* Buton comutator Liquidity Sweeps */}
-            <button
-              onClick={() => setShowSweeps((prev) => !prev)}
-              className={`px-2 py-0.5 text-[10px] md:text-xs font-semibold rounded ${
-                showSweeps ? 'bg-amber-600 text-white' : 'bg-gray-700 text-gray-400'
-              }`}
-            >
-              {showSweeps ? '⚡ Sweeps: ON' : '⚡ Sweeps: OFF'}
-            </button>
-
             <button
               type="button"
               onClick={() => setKeepDomCentered((prev) => !prev)}
@@ -2039,17 +2302,6 @@ export default function DeepLiquidityHeatmapChart() {
               DOM Center: {keepDomCentered ? 'ON' : 'OFF'}
             </button>
 
-            <div className="flex items-center gap-1 text-[10px] md:text-xs text-gray-400 pl-1 border-l border-gray-700">
-              <span>Min USD:</span>
-              <input
-                type="text"
-                value={minLiquidityInput}
-                onChange={(e) => setMinLiquidityInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && applyMinLiquidity()}
-                onBlur={applyMinLiquidity}
-                className="w-14 md:w-20 bg-[#0d0e12] border border-gray-700 rounded px-1 py-0.5 text-center text-white text-[11px] font-bold focus:outline-none"
-              />
-            </div>
           </div>
 
           {currentPrice && (
@@ -2157,11 +2409,21 @@ export default function DeepLiquidityHeatmapChart() {
           
 
           {showLiquidity && (
-            <div className="absolute bottom-2 left-2 z-20 flex items-center gap-2 bg-[#121620]/80 backdrop-blur px-2 py-1 rounded border border-gray-800 text-[9px] md:text-[10px] text-gray-300">
-              <span className="font-bold text-yellow-400">
-                Min. ≥ ${minLiquidityUsd.toLocaleString()}
+            <div
+              title="Estimated liquidation levels use an assumed leverage model and 0.1% price bins. The strongest 5% of active price levels, capped at 12, are marked in the DOM."
+              className="absolute bottom-2 left-2 z-20 flex max-w-[calc(100%-1rem)] items-center gap-2 bg-[#121620]/80 backdrop-blur px-2 py-1 rounded border border-gray-800 text-[9px] md:text-[10px] text-gray-300"
+            >
+              <span className={`font-bold ${
+                liquidationModelStatus === 'ready' ? 'text-blue-300' : 'text-gray-400'
+              }`}>
+                Model: {liquidationModelStatus === 'ready'
+                  ? 'estimated'
+                  : liquidationModelStatus}
               </span>
-              <div className="w-12 md:w-16 h-2 rounded bg-gradient-to-r from-[rgb(255,140,0)] to-[rgb(220,38,38)]" />
+              <span className="font-bold text-sky-200">
+                Strongest active levels
+              </span>
+              <div className="w-12 md:w-16 h-2 rounded bg-gradient-to-r from-sky-400 to-orange-500" />
             </div>
           )}
 
@@ -2300,6 +2562,8 @@ export default function DeepLiquidityHeatmapChart() {
                 if (row.isCurrentLevel) {
                   rowBgStyle = 'bg-yellow-600/40';
                   priceTextColor = 'text-yellow-300 font-bold';
+                } else if (row.liquidationLevel) {
+                  priceTextColor = 'text-white font-bold [text-shadow:0_1px_2px_#000]';
                 }
 
                 return (
@@ -2314,10 +2578,19 @@ export default function DeepLiquidityHeatmapChart() {
                       right: 0,
                       height: `${ROW_HEIGHT}px`,
                       gridTemplateColumns: domGridTemplateColumns,
+                      backgroundColor: row.liquidationLevel && !row.isCurrentLevel
+                        ? getLiquidationHeatColor(
+                          row.liquidationLevel.value,
+                          liquidationColorScale.minValue,
+                          liquidationColorScale.maxValue
+                        )
+                        : undefined,
                     }}
                     className={`grid items-center gap-1 px-2 border-b border-gray-900/60 cursor-pointer hover:brightness-125 ${rowBgStyle}`}
                   >
-                    <div className="relative h-4 min-w-0 flex items-center overflow-hidden rounded bg-gray-950/90">
+                    <div className={`relative h-4 min-w-0 flex items-center overflow-hidden rounded ${
+                      row.liquidationLevel ? 'bg-transparent' : 'bg-gray-950/90'
+                    }`}>
                       {(() => {
                         const cluster = tradesByLevel.get(row.index);
                         if (!cluster) return null;
@@ -2363,8 +2636,30 @@ export default function DeepLiquidityHeatmapChart() {
                       </span>
                     </div>
 
-                    <div className="text-right h-full min-w-0 flex items-center justify-end overflow-hidden">
-                      <span className={`text-[10px] md:text-[11px] ${priceTextColor}`}>
+                    <div
+                      className="text-right h-full min-w-0 flex items-center justify-end overflow-hidden"
+                    >
+                      {row.liquidationLevel && (
+                        <span
+                          className="mr-1 shrink-0 rounded-sm px-1 text-[8px] font-extrabold leading-3 text-white [text-shadow:0_1px_2px_#000]"
+                          style={{
+                            backgroundColor: getLiquidationHeatColor(
+                              row.liquidationLevel.value,
+                              liquidationColorScale.minValue,
+                              liquidationColorScale.maxValue
+                            ),
+                          }}
+                          title={`Estimated liquidation level: ${formatCompactCurrency(row.liquidationLevel.value)}`}
+                        >
+                          LQ
+                        </span>
+                      )}
+                      <span
+                        className={`text-[10px] md:text-[11px] ${priceTextColor}`}
+                        title={row.liquidationLevel
+                          ? `Estimated liquidation: ${formatCompactCurrency(row.liquidationLevel.value)} (${formatCompactCurrency(row.liquidationLevel.longUsd)} long / ${formatCompactCurrency(row.liquidationLevel.shortUsd)} short) at ${row.liquidationLevel.price}`
+                          : undefined}
+                      >
                         {isHovered ? (
                           <span className="text-yellow-300 font-bold">
                             {calculateDistancePercent(row.price)}
@@ -2396,65 +2691,8 @@ export default function DeepLiquidityHeatmapChart() {
                     viewBox={`0 0 ${tradeFeedWidth} ${visibleTradeHeight}`}
                     preserveAspectRatio="none"
                     role="img"
-                    aria-label={largestLiquidityLevel
-                      ? `Recent trade markers. Largest liquidity level: ${formatCompactCurrency(largestLiquidityLevel.value)} at ${largestLiquidityLevel.price}`
-                      : 'Recent trade markers'}
+                    aria-label="Recent trade markers by price and time"
                   >
-                      {showLiquidity &&
-                        largestLiquidityLevel &&
-                        largestLiquidityLevel.position >= visibleTradeStart &&
-                        largestLiquidityLevel.position <= visibleTradeEnd && (
-                          <line
-                            x1="0"
-                            x2={tradeFeedWidth}
-                            y1={(largestLiquidityLevel.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2}
-                            y2={(largestLiquidityLevel.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2}
-                            stroke="#dc2626"
-                            strokeWidth="2"
-                            vectorEffect="non-scaling-stroke"
-                          >
-                            <title>
-                              {`Largest liquidity level: ${formatCompactCurrency(largestLiquidityLevel.value)} at ${largestLiquidityLevel.price}`}
-                            </title>
-                          </line>
-                        )}
-                      {showLiquidity && visibleSweptLiquidity.map((sweep) => {
-                        const y = (sweep.position - visibleTradeStart) * ROW_HEIGHT + ROW_HEIGHT / 2;
-                        const color = sweep.type === 'BUY_SWEEP' ? '#f59e0b' : '#3b82f6';
-                        const side = sweep.type === 'BUY_SWEEP' ? 'ask' : 'bid';
-
-                        return (
-                          <g key={`swept-${sweep.type}-${sweep.price}-${sweep.timestamp}`}>
-                            <line
-                              x1="0"
-                              x2={tradeFeedWidth}
-                              y1={y}
-                              y2={y}
-                              stroke={color}
-                              strokeWidth="2"
-                              strokeDasharray="5 3"
-                              vectorEffect="non-scaling-stroke"
-                            >
-                              <title>
-                                {`Liquidity taken (${side}): ${formatCompactCurrency(sweep.value)} at ${sweep.price}`}
-                              </title>
-                            </line>
-                            <text
-                              x="3"
-                              y={y - 2}
-                              fill={color}
-                              stroke="#0b0e14"
-                              strokeWidth="2"
-                              paintOrder="stroke"
-                              fontSize="8"
-                              fontWeight="700"
-                              fontFamily="ui-monospace, SFMono-Regular, monospace"
-                            >
-                              TAKEN
-                            </text>
-                          </g>
-                        );
-                      })}
                       {visibleTradePoints.length > 1 && (
                         <polyline
                           ref={tradeFeedLineRef}
